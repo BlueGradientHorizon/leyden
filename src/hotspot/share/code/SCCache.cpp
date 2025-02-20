@@ -271,7 +271,7 @@ void SCCache::close() {
               if (debug_scc.is_enabled()) {
                 MethodTrainingData* mtd = MethodTrainingData::find(methodHandle(Thread::current(), nm->method()));
                 if (mtd != nullptr) {
-                  mtd->iterate_all_compiles([&](CompileTrainingData* ctd) {
+                  mtd->iterate_compiles([&](CompileTrainingData* ctd) {
                     debug_scc.print("     CTD: "); ctd->print_on(&debug_scc); debug_scc.cr();
                   });
                 }
@@ -1320,18 +1320,17 @@ Klass* SCCReader::read_klass(const methodHandle& comp_method, bool shared) {
     }
     assert(k->is_klass(), "sanity");
     ResourceMark rm;
-    const char* comp_name = comp_method->name_and_sig_as_C_string();
     if (k->is_instance_klass() && !InstanceKlass::cast(k)->is_loaded()) {
       set_lookup_failed();
       log_info(scc)("%d '%s' (L%d): Lookup failed for klass %s: not loaded",
-                       compile_id(), comp_name, comp_level(), k->external_name());
+                       compile_id(), comp_method->name_and_sig_as_C_string(), comp_level(), k->external_name());
       return nullptr;
     } else
     // Allow not initialized klass which was uninitialized during code caching or for preload
     if (k->is_instance_klass() && !InstanceKlass::cast(k)->is_initialized() && (init_state == 1) && !_preload) {
       set_lookup_failed();
       log_info(scc)("%d '%s' (L%d): Lookup failed for klass %s: not initialized",
-                       compile_id(), comp_name, comp_level(), k->external_name());
+                       compile_id(), comp_method->name_and_sig_as_C_string(), comp_level(), k->external_name());
       return nullptr;
     }
     if (array_dim > 0) {
@@ -1406,26 +1405,30 @@ Method* SCCReader::read_method(const methodHandle& comp_method, bool shared) {
     }
     assert(m->is_method(), "sanity");
     ResourceMark rm;
-    const char* comp_name = comp_method->name_and_sig_as_C_string();
     Klass* k = m->method_holder();
     if (!k->is_instance_klass()) {
       set_lookup_failed();
-      log_info(scc)("%d '%s' (L%d): Lookup failed for holder %s: not instance klass", compile_id(), comp_name, comp_level(), k->external_name());
+      log_info(scc)("%d '%s' (L%d): Lookup failed for holder %s: not instance klass",
+                    compile_id(), comp_method->name_and_sig_as_C_string(), comp_level(), k->external_name());
       return nullptr;
     } else if (!MetaspaceShared::is_in_shared_metaspace((address)k)) {
       set_lookup_failed();
-      log_info(scc)("%d '%s' (L%d): Lookup failed for holder %s: not in CDS", compile_id(), comp_name, comp_level(), k->external_name());
+      log_info(scc)("%d '%s' (L%d): Lookup failed for holder %s: not in CDS",
+                    compile_id(), comp_method->name_and_sig_as_C_string(), comp_level(), k->external_name());
       return nullptr;
     } else if (!InstanceKlass::cast(k)->is_loaded()) {
       set_lookup_failed();
-      log_info(scc)("%d '%s' (L%d): Lookup failed for holder %s: not loaded", compile_id(), comp_name, comp_level(), k->external_name());
+      log_info(scc)("%d '%s' (L%d): Lookup failed for holder %s: not loaded",
+                    compile_id(), comp_method->name_and_sig_as_C_string(), comp_level(), k->external_name());
       return nullptr;
     } else if (!InstanceKlass::cast(k)->is_linked()) {
       set_lookup_failed();
-      log_info(scc)("%d '%s' (L%d): Lookup failed for holder %s: not linked%s", compile_id(), comp_name, comp_level(), k->external_name(), (_preload ? " for code preload" : ""));
+      log_info(scc)("%d '%s' (L%d): Lookup failed for holder %s: not linked%s",
+                    compile_id(), comp_method->name_and_sig_as_C_string(), comp_level(), k->external_name(), (_preload ? " for code preload" : ""));
       return nullptr;
     }
-    log_info(scc)("%d (L%d): Shared method lookup: %s", compile_id(), comp_level(), m->name_and_sig_as_C_string());
+    log_info(scc)("%d (L%d): Shared method lookup: %s",
+                  compile_id(), comp_level(), m->name_and_sig_as_C_string());
     return m;
   }
   int holder_length = *(int*)addr(code_offset);
@@ -3429,9 +3432,8 @@ SCCEntry* SCCache::write_nmethod(const methodHandle& method,
 #endif
   {
     ResourceMark rm;
-    const char* name   = method->name_and_sig_as_C_string();
     log_info(scc, nmethod)("%d (L%d): Wrote nmethod '%s'%s to AOT Code Cache",
-                           comp_id, (int)comp_level, name, (_for_preload ? " (for preload)" : ""));
+                           comp_id, (int)comp_level, method->name_and_sig_as_C_string(), (_for_preload ? " (for preload)" : ""));
   }
   if (VerifyCachedCode) {
     return nullptr;
@@ -3558,7 +3560,7 @@ void SCCache::print_unused_entries_on(outputStream* st) {
           if (mtd->has_holder()) {
             if (mtd->holder()->method_holder()->is_initialized()) {
               ResourceMark rm;
-              mtd->iterate_all_compiles([&](CompileTrainingData* ctd) {
+              mtd->iterate_compiles([&](CompileTrainingData* ctd) {
                 if ((uint)ctd->level() == entry->comp_level()) {
                   if (ctd->init_deps_left() == 0) {
                     nmethod* nm = mtd->holder()->code();
