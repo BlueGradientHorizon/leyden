@@ -383,9 +383,16 @@ bool SystemDictionaryShared::check_for_exclusion_impl(InstanceKlass* k) {
 
   if (k == UnregisteredClasses::UnregisteredClassLoader_klass()) {
     ResourceMark rm;
-    log_info(cds)("Skipping %s: used only when dumping CDS archive", k->name()->as_C_string());
+    log_debug(cds)("Skipping %s: used only when dumping CDS archive", k->name()->as_C_string());
     return true;
   }
+
+  if (k->name()->equals("jdk/internal/misc/CDS$DummyForDynamicArchive") && !CDSConfig::is_dumping_dynamic_archive()) {
+    ResourceMark rm;
+    log_debug(cds)("Skipping %s: used only when dumping dynamic CDS archive", k->name()->as_C_string());
+    return true;
+  }
+
 
   return false; // false == k should NOT be excluded
 }
@@ -532,6 +539,7 @@ void SystemDictionaryShared::init_dumptime_info(InstanceKlass* k) {
     if (!LambdaFormInvokers::may_be_regenerated_class(k->name())) {
       ResourceMark rm;
       log_debug(cds)("Skipping %s: Class loaded for lambda form invoker regeneration", k->name()->as_C_string());
+      info->set_has_checked_exclusion();
       info->set_excluded();
     }
   }

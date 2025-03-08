@@ -311,7 +311,16 @@ void MetaspaceShared::initialize_for_static_dump() {
 
   if (CDSConfig::is_dumping_preimage_static_archive() || CDSConfig::is_dumping_final_static_archive()) {
     if (!((UseG1GC || UseParallelGC || UseSerialGC || UseEpsilonGC || UseShenandoahGC) && UseCompressedClassPointers)) {
-      vm_exit_during_initialization("Cannot create the CacheDataStore",
+      const char* error;
+      if (CDSConfig::is_experimental_leyden_workflow()) {
+        error = "Cannot create the CacheDataStore";
+      } else if (CDSConfig::is_dumping_preimage_static_archive()) {
+        error = "Cannot create the AOT configuration file";
+      } else {
+        error = "Cannot create the AOT cache";
+      }
+
+      vm_exit_during_initialization(error,
                                     "UseCompressedClassPointers must be enabled, and collector must be G1, Parallel, Serial, Epsilon, or Shenandoah");
     }
   }
@@ -637,7 +646,6 @@ char* VM_PopulateDumpSharedSpace::dump_read_only_tables(AOTClassLocationConfig*&
     FinalImageRecipes::record_recipes();
   }
 
-  AOTLinkedClassBulkLoader::record_unregistered_classes();
   TrainingData::dump_training_data();
 
   MetaspaceShared::write_method_handle_intrinsics();
@@ -721,7 +729,7 @@ void VM_PopulateDumpSharedSpace::doit() {
   // Write the archive file
   const char* static_archive;
   if (CDSConfig::is_dumping_final_static_archive()) {
-    if (CDSConfig::is_leyden_workflow()) {
+    if (CDSConfig::is_experimental_leyden_workflow()) {
       static_archive = CacheDataStore;
     } else {
       static_archive = AOTCache;
@@ -786,18 +794,8 @@ bool MetaspaceShared::may_be_eagerly_linked(InstanceKlass* ik) {
 }
 
 
-void MetaspaceShared::link_shared_classes(bool jcmd_request, TRAPS) {
+void MetaspaceShared::link_shared_classes(TRAPS) {
   AOTClassLinker::initialize();
-
-  if (!jcmd_request && !CDSConfig::is_dumping_dynamic_archive()
-      && !CDSConfig::is_dumping_preimage_static_archive()   // FIXME -- remove this for Leyden??
-      && !CDSConfig::is_dumping_final_static_archive()) {
-    // If we have regenerated invoker classes in the dynamic archive,
-    // they will conflict with the resolved CONSTANT_Klass references that are stored
-    // in the static archive. This is not easy to handle. Let's disable
-    // it for dynamic archive for now.
-    LambdaFormInvokers::regenerate_holder_classes(CHECK);
-  }
 
   // Collect all loaded ClassLoaderData.
   CollectCLDClosure collect_cld(THREAD);
@@ -848,16 +846,6 @@ void MetaspaceShared::link_shared_classes(bool jcmd_request, TRAPS) {
     }
   }
 
-  if (CDSConfig::is_dumping_preimage_static_archive() && RecordTraining) {
-    // Do this after all classes are verified by the above loop.
-    // Any classes loaded from here on will be automatically excluded, so
-    // there's no need to force verification or resolve CP entries.
-    RecordTraining = false;
-    SystemDictionaryShared::ignore_new_classes();
-    LambdaFormInvokers::regenerate_holder_classes(CHECK);
-    RecordTraining = true;
-  }
-
   if (CDSConfig::is_dumping_final_static_archive()) {
     FinalImageRecipes::apply_recipes(CHECK);
   }
@@ -896,8 +884,10 @@ void MetaspaceShared::preload_and_dump(TRAPS) {
 
   if (CDSConfig::new_aot_flags_used()) {
     if (CDSConfig::is_dumping_preimage_static_archive()) {
+      // We are in the JVM that runs the training run. Continue execution,
+      // so that it can finish all clean-up and return the correct exit
+      // code to the OS.
       tty->print_cr("AOTConfiguration recorded: %s", AOTConfiguration);
-      vm_exit(0);
     } else {
       // The JLI launcher only recognizes the "old" -Xshare:dump flag.
       // When the new -XX:AOTMode=create flag is used, we can't return
@@ -1048,23 +1038,6 @@ void MetaspaceShared::preload_and_dump_impl(StaticArchiveBuilder& builder, TRAPS
     }
   }
 
-  // Rewrite and link classes
-  log_info(cds)("Rewriting and linking classes ...");
-
-  // Link any classes which got missed. This would happen if we have loaded classes that
-  // were not explicitly specified in the classlist. E.g., if an interface implemented by class K
-  // fails verification, all other interfaces that were not specified in the classlist but
-  // are implemented by K are not verified.
-  link_shared_classes(false/*not from jcmd*/, CHECK);
-  log_info(cds)("Rewriting and linking classes: done");
-
-  if (CDSConfig::is_dumping_final_static_archive() && CDSConfig::is_leyden_workflow()) {
-    assert(RecordTraining == false, "must be");
-    RecordTraining = true;
-  }
-
-  TrainingData::init_dumptime_table(CHECK); // captures TrainingDataSetLocker
-
 #if INCLUDE_CDS_JAVA_HEAP
   if (CDSConfig::is_dumping_heap()) {
     assert(CDSConfig::allow_only_single_java_thread(), "Required");
@@ -1072,7 +1045,41 @@ void MetaspaceShared::preload_and_dump_impl(StaticArchiveBuilder& builder, TRAPS
       log_info(cds)("archivedBootLayer not available, disabling full module graph");
       CDSConfig::stop_dumping_full_module_graph();
     }
+    // Do this before link_shared_classes(), as the following line may load new classes.
     HeapShared::init_for_dumping(CHECK);
+  }
+#endif
+
+  // Rewrite and link classes
+  log_info(cds)("Rewriting and linking classes ...");
+
+  // Link any classes which got missed. This would happen if we have loaded classes that
+  // were not explicitly specified in the classlist. E.g., if an interface implemented by class K
+  // fails verification, all other interfaces that were not specified in the classlist but
+  // are implemented by K are not verified.
+  link_shared_classes(CHECK);
+  log_info(cds)("Rewriting and linking classes: done");
+
+  if (CDSConfig::is_dumping_final_static_archive()) {
+    assert(RecordTraining == false, "must be");
+    if (CDSConfig::is_dumping_aot_linked_classes()) {
+      RecordTraining = true;
+    }
+  }
+
+  TrainingData::init_dumptime_table(CHECK); // captures TrainingDataSetLocker
+
+  if (CDSConfig::is_dumping_regenerated_lambdaform_invokers()) {
+    // Lambda form invoker regeneration may load extra classes and execute
+    // a lot of Java code. We don't want these to be included into the AOT cache.
+    // This should be done after capturing the training data table, so we won't pollute the
+    // profile.
+    SystemDictionaryShared::ignore_new_classes();
+    LambdaFormInvokers::regenerate_holder_classes(CHECK);
+  }
+
+#if INCLUDE_CDS_JAVA_HEAP
+  if (CDSConfig::is_dumping_heap()) {
     ArchiveHeapWriter::init();
     if (CDSConfig::is_dumping_full_module_graph()) {
       ClassLoaderDataShared::ensure_module_entry_tables_exist();
@@ -1110,17 +1117,10 @@ void MetaspaceShared::preload_and_dump_impl(StaticArchiveBuilder& builder, TRAPS
   VMThread::execute(&op);
   FileMapInfo* mapinfo = op.map_info();
   ArchiveHeapInfo* heap_info = op.heap_info();
-  bool status;
-  if (!CDSConfig::is_leyden_workflow()) {
-    status = write_static_archive(&builder, mapinfo, heap_info);
-  } else if (CDSConfig::is_dumping_preimage_static_archive()) {
-    if ((status = write_static_archive(&builder, mapinfo, heap_info))) {
-      fork_and_dump_final_static_archive();
-    }
-  } else {
-    assert(CDSConfig::is_dumping_final_static_archive(), "must be");
+
+  if (CDSConfig::is_dumping_final_static_archive()) {
     RecordTraining = false;
-    if (StoreCachedCode && CachedCodeFile != nullptr) { // FIXME: new workflow -- remove the CachedCodeFile flag
+    if (StoreCachedCode) {
       if (log_is_enabled(Info, cds, jit)) {
         CDSAccess::test_heap_access_api();
       }
@@ -1141,7 +1141,11 @@ void MetaspaceShared::preload_and_dump_impl(StaticArchiveBuilder& builder, TRAPS
       }
       CDSConfig::disable_dumping_cached_code();
     }
-    status = write_static_archive(&builder, mapinfo, heap_info);
+  }
+
+  bool status = write_static_archive(&builder, mapinfo, heap_info);
+  if (status && CDSConfig::is_experimental_leyden_workflow() && CDSConfig::is_dumping_preimage_static_archive()) {
+    fork_and_dump_final_static_archive();
   }
 
   if (!status) {
@@ -2025,7 +2029,7 @@ void MetaspaceShared::initialize_shared_spaces() {
     TrainingData::print_archived_training_data_on(tty);
 
     if (LoadCachedCode) {
-      tty->print_cr("\n\nCached Code file: %s", CachedCodeFile);
+      tty->print_cr("\n\nCached Code");
       SCCache::print_on(tty);
     }
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, 2025, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -23,39 +23,36 @@
  */
 
 /*
- * @test id=aot
- * @requires vm.cds.write.archived.java.heap
+ * @test
+ * @summary -XX:AOTMode=record should not interfere with app execution: (1) thread creation; (2) exit code
+ * @requires vm.cds.supports.aot.class.linking
+ * @comment work around JDK-8345635
+ * @requires !vm.jvmci.enabled
  * @library /test/jdk/lib/testlibrary /test/lib
- * @build LeydenHello
- * @run driver jdk.test.lib.helpers.ClassFileInstaller -jar app.jar LeydenHelloApp
- * @run driver LeydenHello AOT
- */
-
-/*
- * @test id=leyden
- * @requires vm.cds.write.archived.java.heap
- * @library /test/jdk/lib/testlibrary /test/lib
- * @build LeydenHello
- * @run driver jdk.test.lib.helpers.ClassFileInstaller -jar app.jar LeydenHelloApp
- * @run driver LeydenHello LEYDEN
+ * @build TrainingRun
+ * @run driver jdk.test.lib.helpers.ClassFileInstaller -jar app.jar MyTestApp
+ * @run driver TrainingRun AOT
  */
 
 import jdk.test.lib.cds.CDSAppTester;
 import jdk.test.lib.helpers.ClassFileInstaller;
 import jdk.test.lib.process.OutputAnalyzer;
 
-public class LeydenHello {
+public class TrainingRun {
     static final String appJar = ClassFileInstaller.getJarPath("app.jar");
-    static final String mainClass = "LeydenHelloApp";
+    static final String mainClass = "MyTestApp";
 
     public static void main(String[] args) throws Exception {
-        Tester t = new Tester();
-        t.run(args);
+        (new Tester()).run(args);
     }
 
     static class Tester extends CDSAppTester {
         public Tester() {
             super(mainClass);
+
+            // CDSAppTester usually wants the app to return exit value 0, but this test
+            // checks whether the training run can return 2.
+            setCheckExitValue(false);
         }
 
         @Override
@@ -66,21 +63,35 @@ public class LeydenHello {
         @Override
         public String[] appCommandLine(RunMode runMode) {
             return new String[] {
-                mainClass, runMode.name()
+                mainClass,
             };
         }
 
         @Override
         public void checkExecution(OutputAnalyzer out, RunMode runMode) {
             if (runMode.isApplicationExecuted()) {
-                out.shouldContain("Hello Leyden " + runMode.name());
+                out.shouldHaveExitValue(2);
+                out.shouldContain("Hello: x is 1");
             }
         }
     }
 }
 
-class LeydenHelloApp {
-    public static void main(String args[]) {
-        System.out.println("Hello Leyden " + args[0]);
+class MyTestApp {
+    volatile static int x = 0;
+
+    public static void main(String args[]) throws Exception {
+        Thread t = new Thread(() -> {
+                x = 1;
+        });
+        t.start();
+        t.join();
+
+        if (x != 1) {
+            throw new RuntimeException("x should be 1 but is " + x);
+        }
+        System.out.println("Hello: x is " + x);
+        System.out.println("I am calling System.exit(2)");
+        System.exit(2);
     }
 }

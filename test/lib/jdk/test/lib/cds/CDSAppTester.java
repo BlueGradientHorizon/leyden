@@ -100,10 +100,10 @@ abstract public class CDSAppTester {
     public enum RunMode {
         TRAINING,       // -XX:DumpLoadedClassList OR {-XX:AOTMode=create -XX:AOTConfiguration}
         TRAINING0,      // LEYDEN only
-        TRAINING1,      // LEYDEN only
+        TRAINING1,      // LEYDEN only (assembly phase, app logic not executed)
         DUMP_STATIC,    // -Xshare:dump
         DUMP_DYNAMIC,   // -XX:ArchiveClassesArExit
-        ASSEMBLY,       // JEP 483
+        ASSEMBLY,       // JEP 483 (assembly phase, app logic not executed)
         PRODUCTION;     // Running with the CDS archive produced from the above steps
 
         public boolean isStaticDump() {
@@ -111,6 +111,24 @@ abstract public class CDSAppTester {
         }
         public boolean isProductionRun() {
             return this == PRODUCTION;
+        }
+
+        // When <code>CDSAppTester::checkExecution(out, runMode)</code> is called, has the application been
+        // executed? If so, <code>out</code> should contain logs printed by the application's own logic.
+        public boolean isApplicationExecuted() {
+            return (this != TRAINING1) && (this != ASSEMBLY) && (this != DUMP_STATIC);
+        }
+    }
+
+    public boolean isDumping(RunMode runMode) {
+        if (isStaticWorkflow()) {
+            return runMode == RunMode.DUMP_STATIC;
+        } else if (isDynamicWorkflow()) {
+            return runMode == RunMode.DUMP_DYNAMIC;
+        } else if (isAOTWorkflow()) {
+            return runMode == RunMode.TRAINING || runMode == RunMode.ASSEMBLY;
+        } else {
+            return runMode == RunMode.TRAINING || runMode == RunMode.TRAINING0 || runMode == RunMode.TRAINING1;
         }
     }
 
@@ -202,7 +220,9 @@ abstract public class CDSAppTester {
                                                    "-XX:AOTConfiguration=" + aotConfigurationFile,
                                                    "-cp", classpath(runMode),
                                                    logToFile(aotConfigurationFileLog,
-                                                             "class+load=debug"));
+                                                             "class+load=debug",
+                                                             "cds=debug",
+                                                             "cds+class=debug"));
         cmdLine = StringArrayUtils.concat(cmdLine, appCommandLine(runMode));
         return executeAndCheck(cmdLine, runMode, aotConfigurationFile, aotConfigurationFileLog);
     }
@@ -380,7 +400,6 @@ abstract public class CDSAppTester {
         RunMode runMode = RunMode.PRODUCTION;
         String[] cmdLine = StringArrayUtils.concat(vmArgs(runMode),
                                                    "-XX:+UnlockDiagnosticVMOptions",
-                                                   "-XX:VerifyArchivedFields=2", // make sure archived heap objects are good.
                                                    "-cp", classpath(runMode),
                                                    logToFile(productionRunLog(), "cds"));
 
