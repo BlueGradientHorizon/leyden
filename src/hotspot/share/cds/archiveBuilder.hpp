@@ -96,7 +96,6 @@ class ArchiveBuilder : public StackObj {
 protected:
   DumpRegion* _current_dump_region;
   address _buffer_bottom;                      // for writing the contents of rw/ro regions
-  int _num_dump_regions_used;
 
   // These are the addresses where we will request the static and dynamic archives to be
   // mapped at run time. If the request fails (due to ASLR), we will map the archives at
@@ -214,6 +213,12 @@ private:
   ReservedSpace _shared_rs;
   VirtualSpace _shared_vs;
 
+  // The "pz" region is used only during static dumps to reserve an unused space between SharedBaseAddress and
+  // the bottom of the rw region. During runtime, this space will be filled with a reserved area that disallows
+  // read/write/exec, so we can track for bad CompressedKlassPointers encoding.
+  // Note: this region does NOT exist in the cds archive.
+  DumpRegion _pz_region;
+
   DumpRegion _rw_region;
   DumpRegion _ro_region;
   DumpRegion _cc_region;
@@ -238,6 +243,11 @@ private:
   // statistics
   DumpAllocStats _alloc_stats;
   size_t _total_heap_region_size;
+  struct {
+    size_t _num_ptrs;
+    size_t _num_tagged_ptrs;
+    size_t _num_nulled_ptrs;
+  } _relocated_ptr_info;
 
   void print_region_stats(FileMapInfo *map_info, ArchiveHeapInfo* heap_info);
   void print_bitmap_region_stats(size_t size, size_t total_size);
@@ -258,6 +268,8 @@ public:
     ~OtherROAllocMark();
   };
 
+  void count_relocated_pointer(bool tagged, bool nulled);
+
 private:
   FollowMode get_follow_mode(MetaspaceClosure::Ref *ref);
 
@@ -277,9 +289,6 @@ private:
 
 protected:
   virtual void iterate_roots(MetaspaceClosure* it) = 0;
-
-  static const int _total_dump_regions = 2;
-
   void start_dump_region(DumpRegion* next);
 
 public:
@@ -374,6 +383,7 @@ public:
   void remember_embedded_pointer_in_enclosing_obj(MetaspaceClosure::Ref* ref);
   static void serialize_dynamic_archivable_items(SerializeClosure* soc);
 
+  DumpRegion* pz_region() { return &_pz_region; }
   DumpRegion* rw_region() { return &_rw_region; }
   DumpRegion* ro_region() { return &_ro_region; }
   DumpRegion* cc_region() { return &_cc_region; }

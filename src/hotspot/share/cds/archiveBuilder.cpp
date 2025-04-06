@@ -134,13 +134,27 @@ public:
     size_t field_offset = size_t(bit_offset - _start_idx) * sizeof(address);
     address* ptr_loc = (address*)(_buffered_obj + field_offset);
 
-    address old_p = *ptr_loc;
+    address old_p_with_tags = *ptr_loc;
+    assert(old_p_with_tags != nullptr, "null ptrs shouldn't have been marked");
+
+    address old_p = MetaspaceClosure::strip_tags(old_p_with_tags);
+    uintx tags = MetaspaceClosure::decode_tags(old_p_with_tags);
     address new_p = _builder->get_buffered_addr(old_p);
 
-    log_trace(cds)("Ref: [" PTR_FORMAT "] -> " PTR_FORMAT " => " PTR_FORMAT,
-                   p2i(ptr_loc), p2i(old_p), p2i(new_p));
+    bool nulled;
+    if (new_p == nullptr) {
+      // old_p had a FollowMode of set_to_null
+      nulled = true;
+    } else {
+      new_p = MetaspaceClosure::add_tags(new_p, tags);
+      nulled = false;
+    }
+
+    log_trace(cds)("Ref: [" PTR_FORMAT "] -> " PTR_FORMAT " => " PTR_FORMAT " %zu",
+                   p2i(ptr_loc), p2i(old_p) + tags, p2i(new_p), tags);
 
     ArchivePtrMarker::set_and_mark_pointer(ptr_loc, new_p);
+    ArchiveBuilder::current()->count_relocated_pointer(tags != 0, nulled);
     return true; // keep iterating the bitmap
   }
 };
@@ -158,7 +172,6 @@ void ArchiveBuilder::SourceObjList::relocate(int i, ArchiveBuilder* builder) {
 ArchiveBuilder::ArchiveBuilder() :
   _current_dump_region(nullptr),
   _buffer_bottom(nullptr),
-  _num_dump_regions_used(0),
   _requested_static_archive_bottom(nullptr),
   _requested_static_archive_top(nullptr),
   _requested_dynamic_archive_bottom(nullptr),
@@ -166,6 +179,7 @@ ArchiveBuilder::ArchiveBuilder() :
   _mapped_static_archive_bottom(nullptr),
   _mapped_static_archive_top(nullptr),
   _buffer_to_requested_delta(0),
+  _pz_region("pz", MAX_SHARED_DELTA), // protection zone -- used only during dumping; does NOT exist in cds archive.
   _rw_region("rw", MAX_SHARED_DELTA),
   _ro_region("ro", MAX_SHARED_DELTA),
   _cc_region("cc", MAX_SHARED_DELTA),
@@ -182,6 +196,9 @@ ArchiveBuilder::ArchiveBuilder() :
   _klasses = new (mtClassShared) GrowableArray<Klass*>(4 * K, mtClassShared);
   _symbols = new (mtClassShared) GrowableArray<Symbol*>(256 * K, mtClassShared);
   _entropy_seed = 0x12345678;
+  _relocated_ptr_info._num_ptrs = 0;
+  _relocated_ptr_info._num_tagged_ptrs = 0;
+  _relocated_ptr_info._num_nulled_ptrs = 0;
   assert(_current == nullptr, "must be");
   _current = this;
 }
@@ -331,8 +348,12 @@ address ArchiveBuilder::reserve_buffer() {
   _shared_rs = rs;
 
   _buffer_bottom = buffer_bottom;
-  _current_dump_region = &_rw_region;
-  _num_dump_regions_used = 1;
+
+  if (CDSConfig::is_dumping_static_archive()) {
+    _current_dump_region = &_pz_region;
+  } else {
+    _current_dump_region = &_rw_region;
+  }
   _current_dump_region->init(&_shared_rs, &_shared_vs);
 
   ArchivePtrMarker::initialize(&_ptrmap, &_shared_vs);
@@ -374,7 +395,8 @@ address ArchiveBuilder::reserve_buffer() {
   if (CDSConfig::is_dumping_static_archive()) {
     // We don't want any valid object to be at the very bottom of the archive.
     // See ArchivePtrMarker::mark_pointer().
-    rw_region()->allocate(16);
+    _pz_region.allocate(MetaspaceShared::protection_zone_size());
+    start_dump_region(&_rw_region);
   }
 
   return buffer_bottom;
@@ -562,7 +584,6 @@ ArchiveBuilder::FollowMode ArchiveBuilder::get_follow_mode(MetaspaceClosure::Ref
 void ArchiveBuilder::start_dump_region(DumpRegion* next) {
   current_dump_region()->pack(next);
   _current_dump_region = next;
-  _num_dump_regions_used ++;
 }
 
 char* ArchiveBuilder::ro_strdup(const char* s) {
@@ -758,6 +779,10 @@ void ArchiveBuilder::relocate_metaspaceobj_embedded_pointers() {
   log_info(cds)("Relocating embedded pointers in core regions ... ");
   relocate_embedded_pointers(&_rw_src_objs);
   relocate_embedded_pointers(&_ro_src_objs);
+  log_info(cds)("Relocating %zu pointers, %zu tagged, %zu nulled",
+                _relocated_ptr_info._num_ptrs,
+                _relocated_ptr_info._num_tagged_ptrs,
+                _relocated_ptr_info._num_nulled_ptrs);
 }
 
 #define ADD_COUNT(x) \
@@ -1616,6 +1641,12 @@ void ArchiveBuilder::write_archive(FileMapInfo* mapinfo, ArchiveHeapInfo* heap_i
 
 void ArchiveBuilder::write_region(FileMapInfo* mapinfo, int region_idx, DumpRegion* dump_region, bool read_only,  bool allow_exec) {
   mapinfo->write_region(region_idx, dump_region->base(), dump_region->used(), read_only, allow_exec);
+}
+
+void ArchiveBuilder::count_relocated_pointer(bool tagged, bool nulled) {
+  _relocated_ptr_info._num_ptrs ++;
+  _relocated_ptr_info._num_tagged_ptrs += tagged ? 1 : 0;
+  _relocated_ptr_info._num_nulled_ptrs += nulled ? 1 : 0;
 }
 
 void ArchiveBuilder::print_region_stats(FileMapInfo *mapinfo, ArchiveHeapInfo* heap_info) {
