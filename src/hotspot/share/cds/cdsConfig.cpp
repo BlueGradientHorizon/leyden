@@ -52,11 +52,14 @@ bool CDSConfig::_is_using_optimized_module_handling = true;
 bool CDSConfig::_is_dumping_full_module_graph = true;
 bool CDSConfig::_is_using_full_module_graph = true;
 bool CDSConfig::_has_aot_linked_classes = false;
+bool CDSConfig::_is_one_step_training = false;
+bool CDSConfig::_has_temp_aot_config_file = false;
 bool CDSConfig::_is_loading_packages = false;
 bool CDSConfig::_is_loading_protection_domains = false;
 bool CDSConfig::_is_security_manager_allowed = false;
 bool CDSConfig::_old_cds_flags_used = false;
 bool CDSConfig::_new_aot_flags_used = false;
+bool CDSConfig::_experimental_leyden_flags_used = false;
 bool CDSConfig::_disable_heap_dumping = false;
 
 const char* CDSConfig::_default_archive_path = nullptr;
@@ -413,6 +416,11 @@ void CDSConfig::check_new_flag(bool new_flag_is_default, const char* new_flag_na
                                           "DumpLoadedClassList, SharedClassListFile, or SharedArchiveFile",
                                           new_flag_name));
   }
+  if (experimental_leyden_flags_used() && !new_flag_is_default) {
+    vm_exit_during_initialization(err_msg("Option %s cannot be used at the same time with "
+                                          "CacheDataStore, CDSManualFinalImage, or CDSPreimage",
+                                          new_flag_name));
+  }
 }
 
 #define CHECK_SINGLE_PATH(f) check_flag_single_path(#f, f)
@@ -429,38 +437,48 @@ void CDSConfig::check_aot_flags() {
       !FLAG_IS_DEFAULT(SharedArchiveFile)) {
     _old_cds_flags_used = true;
   }
+  if (!FLAG_IS_DEFAULT(CacheDataStore) ||
+      !FLAG_IS_DEFAULT(CDSManualFinalImage) ||
+      !FLAG_IS_DEFAULT(CDSPreimage)) {
+    _experimental_leyden_flags_used = true;
+  }
 
-  // "New" AOT flags must not be mixed with "classic" flags such as -Xshare:dump
+  // "New" AOT flags must not be mixed with "classic" CDS flags such as -Xshare:dump
   CHECK_NEW_FLAG(AOTCache);
+  CHECK_NEW_FLAG(AOTCacheOutput);
   CHECK_NEW_FLAG(AOTConfiguration);
   CHECK_NEW_FLAG(AOTMode);
 
   CHECK_SINGLE_PATH(AOTCache);
+  CHECK_SINGLE_PATH(AOTCacheOutput);
   CHECK_SINGLE_PATH(AOTConfiguration);
 
-  if (FLAG_IS_DEFAULT(AOTCache) && FLAG_IS_DEFAULT(AOTConfiguration) && FLAG_IS_DEFAULT(AOTMode)) {
-    // AOTCache/AOTConfiguration/AOTMode not used.
-    return;
-  } else {
-    _new_aot_flags_used = true;
+  if (FLAG_IS_DEFAULT(AOTCache) &&
+      FLAG_IS_DEFAULT(AOTMode)) {
+    bool has_cache_output = !FLAG_IS_DEFAULT(AOTCacheOutput);
+    bool has_config = !FLAG_IS_DEFAULT(AOTConfiguration);
+    if (!has_cache_output && !has_config) {
+      // AOT flags are not used. Use classic CDS workflow
+      return;
+    } else if (has_cache_output) {
+      // If AOTCacheOutput has been set, default mode is "record".
+      // Default value for AOTConfiguration, if necessary, will be assigned in check_aotmode_record().
+      FLAG_SET_ERGO(AOTMode, "record");
+    }
   }
+
+  // At least one AOT flag has been used
+ _new_aot_flags_used = true;
 
   if (FLAG_IS_DEFAULT(AOTMode) || strcmp(AOTMode, "auto") == 0 || strcmp(AOTMode, "on") == 0) {
     check_aotmode_auto_or_on();
   } else if (strcmp(AOTMode, "off") == 0) {
     check_aotmode_off();
+  } else if (strcmp(AOTMode, "record") == 0) {
+    check_aotmode_record();
   } else {
-    // AOTMode is record or create
-    if (FLAG_IS_DEFAULT(AOTConfiguration)) {
-      vm_exit_during_initialization(err_msg("-XX:AOTMode=%s cannot be used without setting AOTConfiguration", AOTMode));
-    }
-
-    if (strcmp(AOTMode, "record") == 0) {
-      check_aotmode_record();
-    } else {
-      assert(strcmp(AOTMode, "create") == 0, "checked by AOTModeConstraintFunc");
-      check_aotmode_create();
-    }
+    assert(strcmp(AOTMode, "create") == 0, "checked by AOTModeConstraintFunc");
+    check_aotmode_create();
   }
 }
 
@@ -484,6 +502,26 @@ void CDSConfig::check_aotmode_auto_or_on() {
 }
 
 void CDSConfig::check_aotmode_record() {
+  bool has_config = !FLAG_IS_DEFAULT(AOTConfiguration);
+  bool has_output = !FLAG_IS_DEFAULT(AOTCacheOutput);
+
+  if (has_output) {
+    _is_one_step_training = true;
+    if (!has_config) {
+      // Too early; can't use resource allocation yet.
+      size_t len = strlen(AOTCacheOutput) + 10;
+      char* temp = AllocateHeap(len, mtArguments);
+      jio_snprintf(temp, len, "%s.config", AOTCacheOutput);
+      FLAG_SET_ERGO(AOTConfiguration, temp);
+      FreeHeap(temp);
+      _has_temp_aot_config_file = true;
+    }
+  } else {
+    if (!has_config) {
+      vm_exit_during_initialization("-XX:AOTMode=record cannot be used without setting AOTCacheOutput or AOTConfiguration");
+    }
+  }
+
   if (!FLAG_IS_DEFAULT(AOTCache)) {
     vm_exit_during_initialization("AOTCache must not be specified when using -XX:AOTMode=record");
   }
@@ -499,8 +537,22 @@ void CDSConfig::check_aotmode_record() {
 }
 
 void CDSConfig::check_aotmode_create() {
-  if (FLAG_IS_DEFAULT(AOTCache)) {
-    vm_exit_during_initialization("AOTCache must be specified when using -XX:AOTMode=create");
+  if (FLAG_IS_DEFAULT(AOTConfiguration)) {
+    vm_exit_during_initialization("-XX:AOTMode=create cannot be used without setting AOTConfiguration");
+  }
+
+  bool has_cache = !FLAG_IS_DEFAULT(AOTCache);
+  bool has_cache_output = !FLAG_IS_DEFAULT(AOTCacheOutput);
+
+  if (!has_cache && !has_cache_output) {
+    vm_exit_during_initialization("AOTCache or AOTCacheOutput must be specified when using -XX:AOTMode=create");
+  } else if (has_cache && has_cache_output && strcmp(AOTCache, AOTCacheOutput) != 0) {
+    vm_exit_during_initialization("AOTCache and AOTCacheOutput have different values");
+  }
+
+  if (!has_cache) {
+    precond(has_cache_output);
+    FLAG_SET_ERGO(AOTCache, AOTCacheOutput);
   }
 
   _is_dumping_final_static_archive = true;
@@ -589,8 +641,8 @@ bool CDSConfig::check_vm_args_consistency(bool patch_mod_javabase, bool mode_fla
     FLAG_SET_ERGO(ArchiveReflectionData, false);
 
     if (CDSConfig::is_dumping_archive()) {
-      FLAG_SET_ERGO(RecordTraining, false);
-      FLAG_SET_ERGO(ReplayTraining, false);
+      FLAG_SET_ERGO(AOTRecordTraining, false);
+      FLAG_SET_ERGO(AOTReplayTraining, false);
       FLAG_SET_ERGO(StoreCachedCode, false);
       FLAG_SET_ERGO(LoadCachedCode, false);
     }
@@ -690,21 +742,21 @@ void CDSConfig::setup_compiler_args() {
 
   if (is_dumping_preimage_static_archive() && can_dump_profile_and_compiled_code) {
     // JEP 483 workflow -- training
-    FLAG_SET_ERGO_IF_DEFAULT(RecordTraining, true);
-    FLAG_SET_ERGO(ReplayTraining, false);
+    FLAG_SET_ERGO_IF_DEFAULT(AOTRecordTraining, true);
+    FLAG_SET_ERGO(AOTReplayTraining, false);
     FLAG_SET_ERGO(StoreCachedCode, false);
     FLAG_SET_ERGO(LoadCachedCode, false);
   } else if (is_dumping_final_static_archive() && can_dump_profile_and_compiled_code) {
     // JEP 483 workflow -- assembly
-    FLAG_SET_ERGO(RecordTraining, false); // This will be updated inside MetaspaceShared::preload_and_dump()
-    FLAG_SET_ERGO_IF_DEFAULT(ReplayTraining, true);
+    FLAG_SET_ERGO(AOTRecordTraining, false); // This will be updated inside MetaspaceShared::preload_and_dump()
+    FLAG_SET_ERGO_IF_DEFAULT(AOTReplayTraining, true);
     FLAG_SET_ERGO_IF_DEFAULT(StoreCachedCode, true);
     FLAG_SET_ERGO(LoadCachedCode, false);
     disable_dumping_cached_code(); // Cannot dump cached code until metadata and heap are dumped.
   } else if (is_using_archive() && new_aot_flags_used()) {
     // JEP 483 workflow -- production
-    FLAG_SET_ERGO(RecordTraining, false);
-    FLAG_SET_ERGO_IF_DEFAULT(ReplayTraining, true);
+    FLAG_SET_ERGO(AOTRecordTraining, false);
+    FLAG_SET_ERGO_IF_DEFAULT(AOTReplayTraining, true);
     FLAG_SET_ERGO(StoreCachedCode, false);
     FLAG_SET_ERGO_IF_DEFAULT(LoadCachedCode, true);
 
@@ -713,8 +765,8 @@ void CDSConfig::setup_compiler_args() {
       RequireSharedSpaces = true;
     }
   } else {
-    FLAG_SET_ERGO(ReplayTraining, false);
-    FLAG_SET_ERGO(RecordTraining, false);
+    FLAG_SET_ERGO(AOTReplayTraining, false);
+    FLAG_SET_ERGO(AOTRecordTraining, false);
     FLAG_SET_ERGO(StoreCachedCode, false);
     FLAG_SET_ERGO(LoadCachedCode, false);
   }
@@ -753,7 +805,7 @@ bool CDSConfig::setup_experimental_leyden_workflow(bool xshare_auto_cmd_line) {
   if (CDSPreimage == nullptr) {
     if (os::file_exists(CacheDataStore) /* && TODO: Need to check if CDS file is valid*/) {
       // The CacheDataStore is already up to date. Use it. Also turn on cached code by default.
-      FLAG_SET_ERGO_IF_DEFAULT(ReplayTraining, true);
+      FLAG_SET_ERGO_IF_DEFAULT(AOTReplayTraining, true);
       FLAG_SET_ERGO_IF_DEFAULT(LoadCachedCode, true);
 
       // Leyden temp: make sure the user knows if CDS archive somehow fails to load.
@@ -779,7 +831,7 @@ bool CDSConfig::setup_experimental_leyden_workflow(bool xshare_auto_cmd_line) {
       stop_dumping_full_module_graph();
       FLAG_SET_ERGO(ArchivePackages, false);
       FLAG_SET_ERGO(ArchiveProtectionDomains, false);
-      FLAG_SET_ERGO_IF_DEFAULT(RecordTraining, true);
+      FLAG_SET_ERGO_IF_DEFAULT(AOTRecordTraining, true);
       _is_dumping_static_archive = true;
       _is_dumping_preimage_static_archive = true;
     }
@@ -791,9 +843,9 @@ bool CDSConfig::setup_experimental_leyden_workflow(bool xshare_auto_cmd_line) {
     if (FLAG_SET_CMDLINE(BackgroundCompilation, false) != JVMFlag::SUCCESS) {
       return false;
     }
-    RecordTraining = false; // This will be updated inside MetaspaceShared::preload_and_dump()
+    AOTRecordTraining = false; // This will be updated inside MetaspaceShared::preload_and_dump()
 
-    FLAG_SET_ERGO_IF_DEFAULT(ReplayTraining, true);
+    FLAG_SET_ERGO_IF_DEFAULT(AOTReplayTraining, true);
     // Settings for AOT
     FLAG_SET_ERGO_IF_DEFAULT(StoreCachedCode, true);
     if (StoreCachedCode) {

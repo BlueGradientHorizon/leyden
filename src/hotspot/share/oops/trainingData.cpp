@@ -74,16 +74,13 @@ void TrainingData::initialize() {
   RecompilationSchedule::initialize();
 }
 
-#if INCLUDE_CDS
 static void verify_archived_entry(TrainingData* td, const TrainingData::Key* k) {
   guarantee(TrainingData::Key::can_compute_cds_hash(k), "");
   TrainingData* td1 = TrainingData::lookup_archived_training_data(k);
   guarantee(td == td1, "");
 }
-#endif
 
 void TrainingData::verify() {
-#if INCLUDE_CDS
   if (TrainingData::have_data()) {
     archived_training_data_dictionary()->iterate([&](TrainingData* td) {
       if (td->is_KlassTrainingData()) {
@@ -105,7 +102,6 @@ void TrainingData::verify() {
       }
     });
   }
-#endif
 }
 
 MethodTrainingData* MethodTrainingData::make(const methodHandle& method, bool null_if_not_found, bool use_cache) {
@@ -141,9 +137,7 @@ MethodTrainingData* MethodTrainingData::make(const methodHandle& method, bool nu
 
   Key key(method());
   if (have_data()) {
-#if INCLUDE_CDS
     td = lookup_archived_training_data(&key);
-#endif
     if (td != nullptr) {
       mtd = td->as_MethodTrainingData();
     } else {
@@ -205,6 +199,9 @@ CompileTrainingData* CompileTrainingData::make(CompileTask* task) {
   int compile_id = task->compile_id();
   Thread* thread = Thread::current();
   methodHandle m(thread, task->method());
+  if (m->method_holder() == nullptr) {
+    return nullptr; // do not record (dynamically generated method)
+  }
   MethodTrainingData* mtd = MethodTrainingData::make(m);
   if (mtd == nullptr) {
     return nullptr; // allocation failure
@@ -349,7 +346,7 @@ void MethodTrainingData::prepare(Visitor& visitor) {
     _final_profile  = holder()->method_data();
     assert(_final_profile == nullptr || _final_profile->method() == holder(), "");
   }
-  for (int i = 0; i < CompLevel_count; i++) {
+  for (int i = 0; i < CompLevel_count - 1; i++) {
     CompileTrainingData* ctd = _last_toplevel_compiles[i];
     if (ctd != nullptr) {
       ctd->prepare(visitor);
@@ -491,7 +488,7 @@ void TrainingData::init_dumptime_table(TRAPS) {
       }
     });
 
-    if (VerifyTrainingData) {
+    if (AOTVerifyTrainingData) {
       training_data_set()->verify();
     }
   }
@@ -499,7 +496,6 @@ void TrainingData::init_dumptime_table(TRAPS) {
   RecompilationSchedule::prepare(CHECK);
 }
 
-#if INCLUDE_CDS
 void TrainingData::iterate_roots(MetaspaceClosure* it) {
   if (!need_data()) {
     return;
@@ -579,7 +575,7 @@ void MethodTrainingData::cleanup(Visitor& visitor) {
       key()->make_empty();
     }
   }
-  for (int i = 0; i < CompLevel_count; i++) {
+  for (int i = 0; i < CompLevel_count - 1; i++) {
     CompileTrainingData* ctd = _last_toplevel_compiles[i];
     if (ctd != nullptr) {
       ctd->cleanup(visitor);
@@ -746,7 +742,6 @@ TrainingData* TrainingData::lookup_archived_training_data(const Key* k) {
   }
   return nullptr;
 }
-#endif
 
 template <typename T>
 void TrainingData::DepList<T>::metaspace_pointers_do(MetaspaceClosure* iter) {
@@ -755,21 +750,17 @@ void TrainingData::DepList<T>::metaspace_pointers_do(MetaspaceClosure* iter) {
 
 void KlassTrainingData::metaspace_pointers_do(MetaspaceClosure* iter) {
   log_trace(cds)("Iter(KlassTrainingData): %p", this);
-#if INCLUDE_CDS
   TrainingData::metaspace_pointers_do(iter);
-#endif
   _comp_deps.metaspace_pointers_do(iter);
   iter->push(&_holder);
 }
 
 void MethodTrainingData::metaspace_pointers_do(MetaspaceClosure* iter) {
   log_trace(cds)("Iter(MethodTrainingData): %p", this);
-#if INCLUDE_CDS
   TrainingData::metaspace_pointers_do(iter);
-#endif
   iter->push(&_klass);
   iter->push((Method**)&_holder);
-  for (int i = 0; i < CompLevel_count; i++) {
+  for (int i = 0; i < CompLevel_count - 1; i++) {
     iter->push(&_last_toplevel_compiles[i]);
   }
   iter->push(&_final_profile);
@@ -778,9 +769,7 @@ void MethodTrainingData::metaspace_pointers_do(MetaspaceClosure* iter) {
 
 void CompileTrainingData::metaspace_pointers_do(MetaspaceClosure* iter) {
   log_trace(cds)("Iter(CompileTrainingData): %p", this);
-#if INCLUDE_CDS
   TrainingData::metaspace_pointers_do(iter);
-#endif
   _init_deps.metaspace_pointers_do(iter);
   _ci_records.metaspace_pointers_do(iter);
   iter->push(&_method);
@@ -797,7 +786,6 @@ void TrainingData::DepList<T>::prepare(ClassLoaderData* loader_data) {
   }
 }
 
-#if INCLUDE_CDS
 void KlassTrainingData::remove_unshareable_info() {
   TrainingData::remove_unshareable_info();
   _holder_mirror = nullptr;
@@ -820,5 +808,3 @@ void CompileTrainingData::remove_unshareable_info() {
   _ci_records.remove_unshareable_info();
   _init_deps_left = compute_init_deps_left(true);
 }
-
-#endif // INCLUDE_CDS
