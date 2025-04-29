@@ -23,7 +23,7 @@
  */
 
 #include "asm/macroAssembler.inline.hpp"
-#include "code/SCCache.hpp"
+#include "code/aotCodeCache.hpp"
 #include "gc/shared/barrierSet.hpp"
 #include "gc/shared/cardTable.hpp"
 #include "gc/shared/cardTableBarrierSet.hpp"
@@ -58,15 +58,14 @@ void CardTableBarrierSetAssembler::gen_write_ref_array_post_barrier(MacroAssembl
   __ jcc(Assembler::zero, L_done); // zero count - nothing to do
 
 
-#ifdef _LP64
   __ leaq(end, Address(addr, count, TIMES_OOP, 0));  // end == addr+count*oop_size
   __ subptr(end, BytesPerHeapOop); // end - 1 to make inclusive
   __ shrptr(addr, CardTable::card_shift());
   __ shrptr(end, CardTable::card_shift());
   __ subptr(end, addr); // end --> cards count
 
-  if (SCCache::is_on_for_write()) {
-    // SCA needs relocation info for this address
+  if (AOTCodeCache::is_on_for_write()) {
+    // AOT code needs relocation info for this address
     __ lea(tmp, ExternalAddress((address)byte_map_base));
   } else {
     __ mov64(tmp, byte_map_base);
@@ -76,17 +75,6 @@ __ BIND(L_loop);
   __ movb(Address(addr, count, Address::times_1), 0);
   __ decrement(count);
   __ jcc(Assembler::greaterEqual, L_loop);
-#else
-  __ lea(end,  Address(addr, count, Address::times_ptr, -wordSize));
-  __ shrptr(addr, CardTable::card_shift());
-  __ shrptr(end,   CardTable::card_shift());
-  __ subptr(end, addr); // end --> count
-__ BIND(L_loop);
-  Address cardtable(addr, count, Address::times_1, byte_map_base);
-  __ movb(cardtable, 0);
-  __ decrement(count);
-  __ jcc(Assembler::greaterEqual, L_loop);
-#endif
 
 __ BIND(L_done);
 }
@@ -109,8 +97,8 @@ void CardTableBarrierSetAssembler::store_check(MacroAssembler* masm, Register ob
   // never need to be relocated. On 64bit however the value may be too
   // large for a 32bit displacement.
   intptr_t byte_map_base = (intptr_t)ct->byte_map_base();
-  if (SCCache::is_on_for_write()) {
-    // SCA needs relocation info for this address
+  if (AOTCodeCache::is_on_for_write()) {
+    // AOT code needs relocation info for this address
     ExternalAddress cardtable((address)byte_map_base);
     Address index(noreg, obj, Address::times_1);
     card_addr = __ as_Address(ArrayAddress(cardtable, index), rscratch1);

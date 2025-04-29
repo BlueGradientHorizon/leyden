@@ -23,17 +23,14 @@
  */
 
 #include "classfile/javaClasses.hpp"
-#if INCLUDE_CDS
-#include "code/SCCache.hpp"
-#endif
 #include "code/vmreg.inline.hpp"
 #include "gc/g1/c2/g1BarrierSetC2.hpp"
 #include "gc/g1/g1BarrierSet.hpp"
 #include "gc/g1/g1BarrierSetAssembler.hpp"
 #include "gc/g1/g1BarrierSetRuntime.hpp"
 #include "gc/g1/g1CardTable.hpp"
-#include "gc/g1/g1ThreadLocalData.hpp"
 #include "gc/g1/g1HeapRegion.hpp"
+#include "gc/g1/g1ThreadLocalData.hpp"
 #include "opto/arraycopynode.hpp"
 #include "opto/block.hpp"
 #include "opto/compile.hpp"

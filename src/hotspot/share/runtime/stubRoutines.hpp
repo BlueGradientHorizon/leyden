@@ -202,7 +202,7 @@ public:
   // Dependencies
   friend class StubGenerator;
   friend class VMStructs;
-  friend class SCAddressTable;
+  friend class AOTCodeAddressTable;
 #if INCLUDE_JVMCI
   friend class JVMCIVMStructs;
 #endif
@@ -305,10 +305,6 @@ public:
   static address _string_indexof_array[4];
 
   /* special case: stub employs array of entries */
-
-  // Vector Math Routines
-  static address _vector_f_math[VectorSupport::NUM_VEC_SIZES][VectorSupport::NUM_VECTOR_OP_MATH];
-  static address _vector_d_math[VectorSupport::NUM_VEC_SIZES][VectorSupport::NUM_VECTOR_OP_MATH];
 
   static bool is_stub_code(address addr)                   { return contains(addr); }
 

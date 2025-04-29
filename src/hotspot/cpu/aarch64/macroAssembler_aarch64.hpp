@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1997, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1997, 2025, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2014, 2024, Red Hat Inc. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
@@ -27,8 +27,8 @@
 #define CPU_AARCH64_MACROASSEMBLER_AARCH64_HPP
 
 #include "asm/assembler.inline.hpp"
+#include "code/aotCodeCache.hpp"
 #include "code/vmreg.hpp"
-#include "code/SCCache.hpp"
 #include "metaprogramming/enableIf.hpp"
 #include "oops/compressedOops.hpp"
 #include "oops/compressedKlass.hpp"
@@ -824,8 +824,8 @@ public:
                Register arg_1, Register arg_2, Register arg_3,
                bool check_exceptions = true);
 
-  void get_vm_result  (Register oop_result, Register thread);
-  void get_vm_result_2(Register metadata_result, Register thread);
+  void get_vm_result_oop(Register oop_result, Register thread);
+  void get_vm_result_metadata(Register metadata_result, Register thread);
 
   // These always tightly bind to MacroAssembler::call_VM_base
   // bypassing the virtual implementation
@@ -1316,7 +1316,7 @@ public:
 
   // Check if branches to the non nmethod section require a far jump
   static bool codestub_branch_needs_far_jump() {
-    if (SCCache::is_on_for_write()) {
+    if (AOTCodeCache::is_on_for_write()) {
       // To calculate far_codestub_branch_size correctly.
       return true;
     }
@@ -1619,11 +1619,15 @@ public:
   void aes_round(FloatRegister input, FloatRegister subkey);
 
   // ChaCha20 functions support block
-  void cc20_quarter_round(FloatRegister aVec, FloatRegister bVec,
-          FloatRegister cVec, FloatRegister dVec, FloatRegister scratch,
-          FloatRegister tbl);
-  void cc20_shift_lane_org(FloatRegister bVec, FloatRegister cVec,
-          FloatRegister dVec, bool colToDiag);
+  void cc20_qr_add4(FloatRegister (&addFirst)[4],
+          FloatRegister (&addSecond)[4]);
+  void cc20_qr_xor4(FloatRegister (&firstElem)[4],
+          FloatRegister (&secondElem)[4], FloatRegister (&result)[4]);
+  void cc20_qr_lrot4(FloatRegister (&sourceReg)[4],
+          FloatRegister (&destReg)[4], int bits, FloatRegister table);
+  void cc20_set_qr_registers(FloatRegister (&vectorSet)[4],
+          const FloatRegister (&stateVectors)[16], int idx1, int idx2,
+          int idx3, int idx4);
 
   // Place an ISB after code may have been modified due to a safepoint.
   void safepoint_isb();

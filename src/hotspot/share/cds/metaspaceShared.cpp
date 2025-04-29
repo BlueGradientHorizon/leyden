@@ -60,8 +60,8 @@
 #include "classfile/systemDictionaryShared.hpp"
 #include "classfile/vmClasses.hpp"
 #include "classfile/vmSymbols.hpp"
+#include "code/aotCodeCache.hpp"
 #include "code/codeCache.hpp"
-#include "code/SCCache.hpp"
 #include "compiler/compileBroker.hpp"
 #include "compiler/precompiler.hpp"
 #include "gc/shared/gcVMOperations.hpp"
@@ -1028,13 +1028,6 @@ void MetaspaceShared::preload_and_dump_impl(StaticArchiveBuilder& builder, TRAPS
   link_shared_classes(CHECK);
   log_info(cds)("Rewriting and linking classes: done");
 
-  if (CDSConfig::is_dumping_final_static_archive()) {
-    assert(!AOTRecordTraining, "must be");
-    if (CDSConfig::is_dumping_aot_linked_classes()) {
-      AOTRecordTraining = true;
-    }
-  }
-
   TrainingData::init_dumptime_table(CHECK); // captures TrainingDataSetLocker
 
   if (CDSConfig::is_dumping_regenerated_lambdaform_invokers()) {
@@ -1082,7 +1075,6 @@ void MetaspaceShared::preload_and_dump_impl(StaticArchiveBuilder& builder, TRAPS
   ArchiveHeapInfo* heap_info = op.heap_info();
 
   if (CDSConfig::is_dumping_final_static_archive()) {
-    AOTRecordTraining = false;
     if (StoreCachedCode) {
       if (log_is_enabled(Info, cds, jit)) {
         CDSAccess::test_heap_access_api();
@@ -1098,8 +1090,8 @@ void MetaspaceShared::preload_and_dump_impl(StaticArchiveBuilder& builder, TRAPS
       {
         builder.start_cc_region();
         Precompiler::compile_cached_code(&builder, CHECK);
-        // Write the contents to cached code region and close SCCache before packing the region
-        SCCache::close();
+        // Write the contents to cached code region and close AOTCodeCache before packing the region
+        AOTCodeCache::close();
         builder.end_cc_region();
       }
       CDSConfig::disable_dumping_cached_code();
@@ -1196,15 +1188,6 @@ static int exec_jvm_with_java_tool_options(const char* java_launcher_path, TRAPS
       append_args(&args, ss.freeze(), CHECK_0);
     }
     append_args(&args, "-XX:AOTMode=create", CHECK_0);
-  }
-
-  GrowableArray<const char*> aot_tool_options;
-  jint code;
-  if ((code = Arguments::parse_aot_tool_options_environment_variable(&aot_tool_options)) != JNI_OK) {
-    THROW_MSG_0(vmSymbols::java_lang_InternalError(), err_msg("failed to parse AOT_TOOL_OPTIONS: %d", code));
-  }
-  for (int i = 0; i < aot_tool_options.length(); i++) {
-    append_args(&args, aot_tool_options.at(i), CHECK_0);
   }
 
   Symbol* klass_name = SymbolTable::new_symbol("jdk/internal/misc/CDS$ProcessLauncher");
@@ -2100,7 +2083,7 @@ void MetaspaceShared::initialize_shared_spaces() {
   static_mapinfo->patch_heap_embedded_pointers();
   ArchiveHeapLoader::finish_initialization();
   Universe::load_archived_object_instances();
-  SCCache::initialize();
+  AOTCodeCache::initialize();
 
   // Close the mapinfo file
   static_mapinfo->close();
@@ -2155,7 +2138,7 @@ void MetaspaceShared::initialize_shared_spaces() {
 
     if (LoadCachedCode) {
       tty->print_cr("\n\nCached Code");
-      SCCache::print_on(tty);
+      AOTCodeCache::print_on(tty);
     }
 
     // collect shared symbols and strings

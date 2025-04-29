@@ -23,7 +23,7 @@
  */
 
 #include "cds/aotLinkedClassBulkLoader.hpp"
-#include "code/SCCache.hpp"
+#include "code/aotCodeCache.hpp"
 #include "code/scopeDesc.hpp"
 #include "compiler/compilationPolicy.hpp"
 #include "compiler/compileBroker.hpp"
@@ -58,7 +58,7 @@ int64_t CompilationPolicy::_start_time = 0;
 int CompilationPolicy::_c1_count = 0;
 int CompilationPolicy::_c2_count = 0;
 int CompilationPolicy::_c3_count = 0;
-int CompilationPolicy::_sc_count = 0;
+int CompilationPolicy::_ac_count = 0;
 double CompilationPolicy::_increase_threshold_at_ratio = 0;
 
 CompilationPolicy::TrainingReplayQueue CompilationPolicy::_training_replay_queue;
@@ -167,15 +167,17 @@ void CompilationPolicy::replay_training_at_init_impl(InstanceKlass* klass, TRAPS
       ktd->notice_fully_initialized(); // sets klass->has_init_deps_processed bit
       assert(klass->has_init_deps_processed(), "");
 
-      ktd->iterate_comp_deps([&](CompileTrainingData* ctd) {
-        if (ctd->init_deps_left() == 0) {
-          MethodTrainingData* mtd = ctd->method();
-          if (mtd->has_holder()) {
-            const methodHandle mh(THREAD, const_cast<Method*>(mtd->holder()));
-            CompilationPolicy::maybe_compile_early(mh, THREAD);
+      if (AOTCompileEagerly) {
+        ktd->iterate_comp_deps([&](CompileTrainingData* ctd) {
+          if (ctd->init_deps_left() == 0) {
+            MethodTrainingData* mtd = ctd->method();
+            if (mtd->has_holder()) {
+              const methodHandle mh(THREAD, const_cast<Method*>(mtd->holder()));
+              CompilationPolicy::maybe_compile_early(mh, THREAD);
+            }
           }
-        }
-      });
+        });
+      }
     }
   }
 }
@@ -306,7 +308,7 @@ bool CompilationPolicy::force_comp_at_level_simple(const methodHandle& method) {
     if (UseJVMCICompiler) {
       AbstractCompiler* comp = CompileBroker::compiler(CompLevel_full_optimization);
       if (comp != nullptr && comp->is_jvmci() && ((JVMCICompiler*) comp)->force_comp_at_level_simple(method)) {
-        return !SCCache::is_C3_on();
+        return !AOTCodeCache::is_C3_on();
       }
     }
 #endif
@@ -643,7 +645,7 @@ void CompilationPolicy::initialize() {
         int c1_count = MAX2(count - libjvmci_count, 1);
         set_c2_count(libjvmci_count);
         set_c1_count(c1_count);
-      } else if (SCCache::is_C3_on()) {
+      } else if (AOTCodeCache::is_C3_on()) {
         set_c1_count(MAX2(count / 3, 1));
         set_c2_count(MAX2(count - c1_count(), 1));
         set_c3_count(1);
@@ -659,8 +661,8 @@ void CompilationPolicy::initialize() {
       set_c2_count(count);
       count *= 2; // satisfy the assert below
     }
-    if (SCCache::is_code_load_thread_on()) {
-      set_sc_count((c1_only || c2_only) ? 1 : 2); // At minimum we need 2 threads to load C1 and C2 cached code in parallel
+    if (AOTCodeCache::is_code_load_thread_on()) {
+      set_ac_count((c1_only || c2_only) ? 1 : 2); // At minimum we need 2 threads to load C1 and C2 cached code in parallel
     }
     assert(count == c1_count() + c2_count(), "inconsistent compiler thread count");
     set_increase_threshold_at_ratio();
@@ -804,8 +806,8 @@ CompileTask* CompilationPolicy::select_task(CompileQueue* compile_queue, JavaThr
       task = next_task;
       continue;
     }
-    if (task->is_scc()) {
-      // SCC tasks are on separate queue, and they should load fast. There is no need to walk
+    if (task->is_aot()) {
+      // AOTCodeCache tasks are on separate queue, and they should load fast. There is no need to walk
       // the rest of the queue, just take the task and go.
       return task;
     }
@@ -1091,7 +1093,7 @@ bool CompilationPolicy::compare_methods(Method* x, Method* y) {
 }
 
 bool CompilationPolicy::compare_tasks(CompileTask* x, CompileTask* y) {
-  assert(!x->is_scc() && !y->is_scc(), "SC tasks are not expected here");
+  assert(!x->is_aot() && !y->is_aot(), "AOT code caching tasks are not expected here");
   if (x->compile_reason() != y->compile_reason() && y->compile_reason() == CompileTask::Reason_MustBeCompiled) {
     return true;
   }
@@ -1139,7 +1141,6 @@ bool CompilationPolicy::should_create_mdo(const methodHandle& method, CompLevel 
     if (mtd != nullptr && mtd->saw_level(CompLevel_full_optimization)) {
       return true;
     }
-    return false;
   }
 
   if (is_old(method)) {
@@ -1365,32 +1366,29 @@ CompLevel CompilationPolicy::trained_transition(const methodHandle& method, Comp
 template<typename Predicate>
 CompLevel CompilationPolicy::common(const methodHandle& method, CompLevel cur_level, JavaThread* THREAD, bool disable_feedback) {
   CompLevel next_level = cur_level;
-  int i = method->invocation_count();
-  int b = method->backedge_count();
 
   if (force_comp_at_level_simple(method)) {
     next_level = CompLevel_simple;
-  } else {
-    if (MethodTrainingData::have_data()) {
-      MethodTrainingData* mtd = MethodTrainingData::find_fast(method);
-      if (mtd == nullptr) {
-        // We haven't see compilations of this method in training. It's either very cold or the behavior changed.
-        // Feed it to the standard TF with no profiling delay.
-        next_level = standard_transition<Predicate>(method, cur_level, false /*delay_profiling*/, disable_feedback);
-      } else {
-        next_level = trained_transition(method, cur_level, mtd, THREAD);
-        if (cur_level == next_level) {
-          // trained_transtion() is going to return the same level if no startup/warmup optimizations apply.
-          // In order to catch possible pathologies due to behavior change we feed the event to the regular
-          // TF but with profiling delay.
-          next_level = standard_transition<Predicate>(method, cur_level, true /*delay_profiling*/, disable_feedback);
-        }
-      }
-    } else if (is_trivial(method) || method->is_native()) {
-      next_level = CompilationModeFlag::disable_intermediate() ? CompLevel_full_optimization : CompLevel_simple;
-    } else {
+  } else if (is_trivial(method) || method->is_native()) {
+    // We do not care if there is profiling data for these methods, throw them to compiler.
+    next_level = CompilationModeFlag::disable_intermediate() ? CompLevel_full_optimization : CompLevel_simple;
+  } else if (MethodTrainingData::have_data()) {
+    MethodTrainingData* mtd = MethodTrainingData::find_fast(method);
+    if (mtd == nullptr) {
+      // We haven't see compilations of this method in training. It's either very cold or the behavior changed.
+      // Feed it to the standard TF with no profiling delay.
       next_level = standard_transition<Predicate>(method, cur_level, false /*delay_profiling*/, disable_feedback);
+    } else {
+      next_level = trained_transition(method, cur_level, mtd, THREAD);
+      if (cur_level == next_level) {
+        // trained_transtion() is going to return the same level if no startup/warmup optimizations apply.
+        // In order to catch possible pathologies due to behavior change we feed the event to the regular
+        // TF but with profiling delay.
+        next_level = standard_transition<Predicate>(method, cur_level, true /*delay_profiling*/, disable_feedback);
+      }
     }
+  } else {
+    next_level = standard_transition<Predicate>(method, cur_level, false /*delay_profiling*/, disable_feedback);
   }
   return (next_level != cur_level) ? limit_level(next_level) : next_level;
 }

@@ -28,9 +28,6 @@
 #include "ci/ciEnv.hpp"
 #include "ci/ciUtilities.hpp"
 #include "code/compiledIC.hpp"
-#if INCLUDE_CDS
-#include "code/SCCache.hpp"
-#endif
 #include "compiler/compileTask.hpp"
 #include "compiler/disassembler.hpp"
 #include "compiler/oopMap.hpp"
@@ -699,7 +696,7 @@ void MacroAssembler::set_last_Java_frame(Register last_java_sp,
 }
 
 static inline bool target_needs_far_branch(address addr) {
-  if (SCCache::is_on_for_write()) {
+  if (AOTCodeCache::is_on_for_write()) {
     return true;
   }
   // codecache size <= 128M
@@ -876,7 +873,7 @@ void MacroAssembler::call_VM_base(Register oop_result,
 
   // get oop result if there is one and reset the value in the thread
   if (oop_result->is_valid()) {
-    get_vm_result(oop_result, java_thread);
+    get_vm_result_oop(oop_result, java_thread);
   }
 }
 
@@ -886,7 +883,7 @@ void MacroAssembler::call_VM_helper(Register oop_result, address entry_point, in
 
 // Check the entry target is always reachable from any branch.
 static bool is_always_within_branch_range(Address entry) {
-  if (SCCache::is_on_for_write()) {
+  if (AOTCodeCache::is_on_for_write()) {
     return false;
   }
   const address target = entry.target();
@@ -1175,15 +1172,15 @@ void MacroAssembler::call_VM(Register oop_result,
 }
 
 
-void MacroAssembler::get_vm_result(Register oop_result, Register java_thread) {
-  ldr(oop_result, Address(java_thread, JavaThread::vm_result_offset()));
-  str(zr, Address(java_thread, JavaThread::vm_result_offset()));
+void MacroAssembler::get_vm_result_oop(Register oop_result, Register java_thread) {
+  ldr(oop_result, Address(java_thread, JavaThread::vm_result_oop_offset()));
+  str(zr, Address(java_thread, JavaThread::vm_result_oop_offset()));
   verify_oop_msg(oop_result, "broken oop in call_VM_base");
 }
 
-void MacroAssembler::get_vm_result_2(Register metadata_result, Register java_thread) {
-  ldr(metadata_result, Address(java_thread, JavaThread::vm_result_2_offset()));
-  str(zr, Address(java_thread, JavaThread::vm_result_2_offset()));
+void MacroAssembler::get_vm_result_metadata(Register metadata_result, Register java_thread) {
+  ldr(metadata_result, Address(java_thread, JavaThread::vm_result_metadata_offset()));
+  str(zr, Address(java_thread, JavaThread::vm_result_metadata_offset()));
 }
 
 void MacroAssembler::align(int modulus) {
@@ -2071,7 +2068,7 @@ void MacroAssembler::clinit_barrier(Register klass, Register scratch, Label* L_f
   // Fast path check: class is fully initialized
   lea(scratch, Address(klass, InstanceKlass::init_state_offset()));
   ldarb(scratch, scratch);
-  subs(zr, scratch, InstanceKlass::fully_initialized);
+  cmp(scratch, InstanceKlass::fully_initialized);
   br(Assembler::EQ, *L_fast_path);
 
   // Fast path check: current thread is initializer thread
@@ -3264,12 +3261,13 @@ void MacroAssembler::resolve_global_jobject(Register value, Register tmp1, Regis
 }
 
 void MacroAssembler::stop(const char* msg) {
-  BLOCK_COMMENT(msg);
+  // Skip AOT caching C strings in scratch buffer.
+  const char* str = (code_section()->scratch_emit()) ? msg : AOTCodeCache::add_C_string(msg);
+  BLOCK_COMMENT(str);
   // load msg into r0 so we can access it from the signal handler
   // ExternalAddress enables saving and restoring via the code cache
-  lea(c_rarg0, ExternalAddress((address) msg));
+  lea(c_rarg0, ExternalAddress((address) str));
   dcps1(0xdeae);
-  SCCache::add_C_string(msg);
 }
 
 void MacroAssembler::unimplemented(const char* what) {
@@ -3367,7 +3365,7 @@ void MacroAssembler::subw(Register Rd, Register Rn, RegisterOrConstant decrement
 void MacroAssembler::reinit_heapbase()
 {
   if (UseCompressedOops) {
-    if (Universe::is_fully_initialized() && !SCCache::is_on_for_write()) {
+    if (Universe::is_fully_initialized() && !AOTCodeCache::is_on_for_write()) {
       mov(rheapbase, CompressedOops::base());
     } else {
       lea(rheapbase, ExternalAddress(CompressedOops::base_addr()));
@@ -5737,8 +5735,8 @@ void MacroAssembler::load_byte_map_base(Register reg) {
   // Strictly speaking the byte_map_base isn't an address at all, and it might
   // even be negative. It is thus materialised as a constant.
 #if INCLUDE_CDS
-  if (SCCache::is_on_for_write()) {
-    // SCA needs relocation info for card table base
+  if (AOTCodeCache::is_on_for_write()) {
+    // AOT code needs relocation info for card table base
     lea(reg, ExternalAddress(reinterpret_cast<address>(byte_map_base)));
   } else {
 #endif
@@ -5751,8 +5749,8 @@ void MacroAssembler::load_byte_map_base(Register reg) {
 void MacroAssembler::load_aotrc_address(Register reg, address a) {
 #if INCLUDE_CDS
   assert(AOTRuntimeConstants::contains(a), "address out of range for data area");
-  if (SCCache::is_on_for_write()) {
-    // all aotrc field addresses should be registered in the SCC address table
+  if (AOTCodeCache::is_on_for_write()) {
+    // all aotrc field addresses should be registered in the AOTCodeCache address table
     lea(reg, ExternalAddress(a));
   } else {
     mov(reg, (uint64_t)a);
@@ -7090,8 +7088,15 @@ void MacroAssembler::lightweight_lock(Register basic_lock, Register obj, Registe
   ldr(mark, Address(obj, oopDesc::mark_offset_in_bytes()));
 
   if (UseObjectMonitorTable) {
-    // Clear cache in case fast locking succeeds.
+    // Clear cache in case fast locking succeeds or we need to take the slow-path.
     str(zr, Address(basic_lock, BasicObjectLock::lock_offset() + in_ByteSize((BasicLock::object_monitor_cache_offset_in_bytes()))));
+  }
+
+  if (DiagnoseSyncOnValueBasedClasses != 0) {
+    load_klass(t1, obj);
+    ldrb(t1, Address(t1, Klass::misc_flags_offset()));
+    tst(t1, KlassFlags::_misc_is_value_based_class);
+    br(Assembler::NE, slow);
   }
 
   // Check if the lock-stack is full.
