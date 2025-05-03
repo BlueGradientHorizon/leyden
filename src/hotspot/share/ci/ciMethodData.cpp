@@ -31,6 +31,7 @@
 #include "memory/resourceArea.hpp"
 #include "oops/klass.inline.hpp"
 #include "oops/methodData.inline.hpp"
+#include "oops/trainingData.hpp"
 #include "runtime/deoptimization.hpp"
 #include "utilities/copy.hpp"
 
@@ -54,6 +55,15 @@ ciMethodData::ciMethodData(MethodData* md)
   _invocation_counter(0),
   _orig() {}
 
+
+static bool is_klass_loaded(Klass* k) {
+  if (TrainingData::have_data()) {
+    // If we're running in AOT mode some classes may not be loaded yet
+    return !k->is_instance_klass() || InstanceKlass::cast(k)->is_loaded();
+  }
+  return true;
+}
+
 // Check for entries that reference an unloaded method
 class PrepareExtraDataClosure : public CleanExtraDataClosure {
   MethodData*            _mdo;
@@ -69,10 +79,7 @@ public:
 
   bool is_live(Method* m) {
     Klass* holder = m->method_holder();
-    if (holder == nullptr || // premain: not yet loaded
-        holder->class_loader_data() == nullptr ||
-        !holder->is_loader_alive() ||
-        (holder->is_instance_klass() && !InstanceKlass::cast(holder)->is_loaded())) {
+    if (holder == nullptr || !holder->is_loader_present_and_alive() || !is_klass_loaded(holder)) {
       return false;
     }
     if (CURRENT_ENV->cached_metadata(m) == nullptr) {
@@ -307,8 +314,7 @@ bool ciMethodData::load_data() {
 void ciReceiverTypeData::translate_receiver_data_from(const ProfileData* data) {
   for (uint row = 0; row < row_limit(); row++) {
     Klass* k = data->as_ReceiverTypeData()->receiver(row);
-    if (k != nullptr && k->class_loader_data() != nullptr &&
-        (!k->is_instance_klass() || InstanceKlass::cast(k)->is_loaded())) {
+    if (k != nullptr && k->class_loader_data() != nullptr && is_klass_loaded(k)) {
       if (k->is_loader_alive()) {
         ciKlass* klass = CURRENT_ENV->get_klass(k);
         set_receiver(row, klass);
@@ -326,9 +332,7 @@ void ciTypeStackSlotEntries::translate_type_data_from(const TypeStackSlotEntries
   for (int i = 0; i < number_of_entries(); i++) {
     intptr_t k = entries->type(i);
     Klass* klass = (Klass*)klass_part(k);
-    if (klass != nullptr &&
-        ((klass->is_instance_klass() && !InstanceKlass::cast(klass)->is_loaded()) ||
-         (klass->class_loader_data() == nullptr || !klass->is_loader_alive()))) {
+    if (klass == nullptr || !klass->is_loader_present_and_alive() || !is_klass_loaded(klass)) {
       // With concurrent class unloading, the MDO could have stale metadata; override it
       TypeStackSlotEntries::set_type(i, TypeStackSlotEntries::with_status((Klass*)nullptr, k));
     } else {
@@ -340,9 +344,7 @@ void ciTypeStackSlotEntries::translate_type_data_from(const TypeStackSlotEntries
 void ciReturnTypeEntry::translate_type_data_from(const ReturnTypeEntry* ret) {
   intptr_t k = ret->type();
   Klass* klass = (Klass*)klass_part(k);
-  if (klass != nullptr &&
-      ((klass->is_instance_klass() && !InstanceKlass::cast(klass)->is_loaded()) ||
-       (klass->class_loader_data() == nullptr || !klass->is_loader_alive()))) {
+  if (klass == nullptr || !klass->is_loader_present_and_alive() || !is_klass_loaded(klass)) {
     // With concurrent class unloading, the MDO could have stale metadata; override it
     set_type(ReturnTypeEntry::with_status((Klass*)nullptr, k));
   } else {
