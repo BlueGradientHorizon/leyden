@@ -32,6 +32,7 @@
 #include "classfile/classLoaderDataShared.hpp"
 #include "classfile/moduleEntry.hpp"
 #include "classfile/systemDictionaryShared.hpp"
+#include "code/aotCodeCache.hpp"
 #include "include/jvm_io.h"
 #include "logging/log.hpp"
 #include "prims/jvmtiExport.hpp"
@@ -119,6 +120,26 @@ void CDSConfig::ergo_initialize() {
   if (!is_dumping_heap()) {
     _is_dumping_full_module_graph = false;
   }
+
+#ifdef _LP64
+  //
+  // By default, when using AOTClassLinking, use the CompressedOops::HeapBasedNarrowOop
+  // mode so that AOT code can be always work regardless of runtime heap range.
+  //
+  // If you are *absolutely sure* that the CompressedOops::mode() will be the same
+  // between training and production runs (e.g., if you specify -Xmx128m for
+  // both training and production runs, and you know the OS will always reserve
+  // the heap under 4GB), you can explicitly disable this with:
+  //     java -XX:+UnlockDiagnosticVMOptions -XX:-UseCompatibleCompressedOops ...
+  // However, this is risky and there's a chance that the production run will be slower
+  // than expected because it is unable to load the AOT code cache.
+  //
+  if (UseCompressedOops && AOTCodeCache::is_caching_enabled()) {
+    FLAG_SET_ERGO_IF_DEFAULT(UseCompatibleCompressedOops, true);
+  } else if (!FLAG_IS_DEFAULT(UseCompatibleCompressedOops)) {
+    FLAG_SET_ERGO(UseCompatibleCompressedOops, false);
+  }
+#endif // _LP64
 }
 
 const char* CDSConfig::default_archive_path() {
@@ -467,7 +488,7 @@ void CDSConfig::check_aot_flags() {
   }
 
   // At least one AOT flag has been used
- _new_aot_flags_used = true;
+  _new_aot_flags_used = true;
 
   if (FLAG_IS_DEFAULT(AOTMode) || strcmp(AOTMode, "auto") == 0 || strcmp(AOTMode, "on") == 0) {
     check_aotmode_auto_or_on();
@@ -642,14 +663,8 @@ bool CDSConfig::check_vm_args_consistency(bool patch_mod_javabase, bool mode_fla
     if (CDSConfig::is_dumping_archive()) {
       FLAG_SET_ERGO(AOTRecordTraining, false);
       FLAG_SET_ERGO(AOTReplayTraining, false);
-      FLAG_SET_ERGO(StoreCachedCode, false);
-      FLAG_SET_ERGO(LoadCachedCode, false);
+      AOTCodeCache::disable_caching();
     }
-  }
-
-  if (StoreCachedCode) {
-    log_info(cds)("ArchiveAdapters is enabled");
-    FLAG_SET_ERGO_IF_DEFAULT(ArchiveAdapters, true);
   }
 
 #ifdef _WINDOWS
@@ -743,21 +758,18 @@ void CDSConfig::setup_compiler_args() {
     // JEP 483 workflow -- training
     FLAG_SET_ERGO_IF_DEFAULT(AOTRecordTraining, true);
     FLAG_SET_ERGO(AOTReplayTraining, false);
-    FLAG_SET_ERGO(StoreCachedCode, false);
-    FLAG_SET_ERGO(LoadCachedCode, false);
+    AOTCodeCache::disable_caching();
   } else if (is_dumping_final_static_archive() && can_dump_profile_and_compiled_code) {
     // JEP 483 workflow -- assembly
     FLAG_SET_ERGO(AOTRecordTraining, false);
     FLAG_SET_ERGO_IF_DEFAULT(AOTReplayTraining, true);
-    FLAG_SET_ERGO_IF_DEFAULT(StoreCachedCode, true);
-    FLAG_SET_ERGO(LoadCachedCode, false);
-    disable_dumping_cached_code(); // Cannot dump cached code until metadata and heap are dumped.
+    AOTCodeCache::enable_caching();
+    disable_dumping_aot_code(); // Cannot dump aot code until metadata and heap are dumped.
   } else if (is_using_archive() && new_aot_flags_used()) {
     // JEP 483 workflow -- production
     FLAG_SET_ERGO(AOTRecordTraining, false);
     FLAG_SET_ERGO_IF_DEFAULT(AOTReplayTraining, true);
-    FLAG_SET_ERGO(StoreCachedCode, false);
-    FLAG_SET_ERGO_IF_DEFAULT(LoadCachedCode, true);
+    AOTCodeCache::enable_caching();
 
     if (UseSharedSpaces && FLAG_IS_DEFAULT(AOTMode)) {
       log_info(cds)("Enabled -XX:AOTMode=on by default for troubleshooting Leyden prototype");
@@ -766,30 +778,13 @@ void CDSConfig::setup_compiler_args() {
   } else {
     FLAG_SET_ERGO(AOTReplayTraining, false);
     FLAG_SET_ERGO(AOTRecordTraining, false);
-    FLAG_SET_ERGO(StoreCachedCode, false);
-    FLAG_SET_ERGO(LoadCachedCode, false);
+    AOTCodeCache::disable_caching();
   }
 }
 
 // Ergo set-up of various flags used by the experimental workflow that uses -XX:CacheDataStore. This workflow
 // is deprecated and will be removed from Leyden.
 bool CDSConfig::setup_experimental_leyden_workflow(bool xshare_auto_cmd_line) {
-  // Leyden temp work-around:
-  //
-  // By default, when using CacheDataStore, use the HeapBasedNarrowOop mode so that
-  // AOT code can be always work regardless of runtime heap range.
-  //
-  // If you are *absolutely sure* that the CompressedOops::mode() will be the same
-  // between training and production runs (e.g., if you specify -Xmx128m
-  // for both training and production runs, and you know the OS will always reserve
-  // the heap under 4GB), you can explicitly disable this with:
-  //     java -XX:-UseCompatibleCompressedOops -XX:CacheDataStore=...
-  // However, this is risky and there's a chance that the production run will be slower
-  // because it is unable to load the AOT code cache.
-#ifdef _LP64
-  // FLAG_SET_ERGO_IF_DEFAULT(UseCompatibleCompressedOops, true); // FIXME @iklam - merge with mainline - UseCompatibleCompressedOops
-#endif
-
   if (FLAG_IS_DEFAULT(AOTClassLinking)) {
     FLAG_SET_ERGO(AOTClassLinking, true);
   }
@@ -803,9 +798,9 @@ bool CDSConfig::setup_experimental_leyden_workflow(bool xshare_auto_cmd_line) {
 
   if (CDSPreimage == nullptr) {
     if (os::file_exists(CacheDataStore) /* && TODO: Need to check if CDS file is valid*/) {
-      // The CacheDataStore is already up to date. Use it. Also turn on cached code by default.
+      // The CacheDataStore is already up to date. Use it. Also turn on aot code by default.
       FLAG_SET_ERGO_IF_DEFAULT(AOTReplayTraining, true);
-      FLAG_SET_ERGO_IF_DEFAULT(LoadCachedCode, true);
+      AOTCodeCache::enable_caching();
 
       // Leyden temp: make sure the user knows if CDS archive somehow fails to load.
       if (UseSharedSpaces && !xshare_auto_cmd_line) {
@@ -846,10 +841,10 @@ bool CDSConfig::setup_experimental_leyden_workflow(bool xshare_auto_cmd_line) {
 
     FLAG_SET_ERGO_IF_DEFAULT(AOTReplayTraining, true);
     // Settings for AOT
-    FLAG_SET_ERGO_IF_DEFAULT(StoreCachedCode, true);
-    if (StoreCachedCode) {
-      // Cannot dump cached code until metadata and heap are dumped.
-      disable_dumping_cached_code();
+    AOTCodeCache::enable_caching(); // Update default settings
+    if (AOTCodeCache::is_caching_enabled()) {
+      // Cannot dump aot code until metadata and heap are dumped.
+      disable_dumping_aot_code();
     }
     _is_dumping_static_archive = true;
     _is_dumping_final_static_archive = true;
@@ -1176,24 +1171,23 @@ bool CDSConfig::is_dumping_method_handles() {
 
 #endif // INCLUDE_CDS_JAVA_HEAP
 
-// This is allowed by default. We disable it only in the final image dump before the
-// metadata and heap are dumped.
-static bool _is_dumping_cached_code = true;
+// AOT code generation and its archiving is disabled by default.
+// We enable it only in the final image dump after the metadata and heap are dumped.
+// This affects only JITed code because it may have embedded oops and metadata pointers
+// which AOT code encodes as offsets in final CDS archive regions.
 
-bool CDSConfig::is_dumping_cached_code() {
-  return _is_dumping_cached_code;
+static bool _is_dumping_aot_code = false;
+
+bool CDSConfig::is_dumping_aot_code() {
+  return _is_dumping_aot_code;
 }
 
-void CDSConfig::disable_dumping_cached_code() {
-  _is_dumping_cached_code = false;
+void CDSConfig::disable_dumping_aot_code() {
+  _is_dumping_aot_code = false;
 }
 
-void CDSConfig::enable_dumping_cached_code() {
-  _is_dumping_cached_code = true;
-}
-
-bool CDSConfig::is_dumping_adapters() {
-  return (ArchiveAdapters && is_dumping_final_static_archive());
+void CDSConfig::enable_dumping_aot_code() {
+  _is_dumping_aot_code = true;
 }
 
 bool CDSConfig::is_experimental_leyden_workflow() {

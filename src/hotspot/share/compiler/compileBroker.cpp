@@ -1577,7 +1577,7 @@ AOTCodeEntry* CompileBroker::find_aot_code_entry(const methodHandle& method, int
                                         CompileTask::CompileReason compile_reason,
                                         bool requires_online_compilation) {
   AOTCodeEntry* aot_code_entry = nullptr;
-  if (osr_bci == InvocationEntryBci && !requires_online_compilation && AOTCodeCache::is_on_for_read()) {
+  if (osr_bci == InvocationEntryBci && !requires_online_compilation && AOTCodeCache::is_on_for_use()) {
     // Check for cached code.
     if (compile_reason == CompileTask::Reason_Preload) {
       aot_code_entry = method->aot_code_entry();
@@ -3103,7 +3103,7 @@ void CompileBroker::print_statistics_on(outputStream* st) {
   }
   st->cr();
 
-  if (LoadCachedCode || StoreCachedCode) {
+  if (AOTCodeCaching) {
     for (int tier = CompLevel_simple; tier <= CompilationPolicy::highest_compile_level() + 1; tier++) {
       if (tier != CompLevel_full_profile) {
         print_tier_helper(st, "AOT Code T", tier, &_aot_stats_per_level[tier - 1]);
@@ -3196,7 +3196,7 @@ void CompileBroker::print_times(bool per_compiler, bool aggregate) {
                 CompileBroker::_t_invalidated_compilation.seconds(),
                 total_invalidated_count == 0 ? 0.0 : CompileBroker::_t_invalidated_compilation.seconds() / total_invalidated_count);
 
-  if (StoreCachedCode || LoadCachedCode) { // Check flags because AOT code cache could be closed already
+  if (AOTCodeCaching) { // Check flags because AOT code cache could be closed already
     tty->cr();
     AOTCodeCache::print_timers_on(tty);
   }

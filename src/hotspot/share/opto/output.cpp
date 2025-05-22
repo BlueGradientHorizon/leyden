@@ -2972,7 +2972,7 @@ void Scheduling::anti_do_def( Block *b, Node *def, OptoReg::Name def_reg, int is
   }
 
   Node *kill = def;             // Rename 'def' to more descriptive 'kill'
-  debug_only( def = (Node*)((intptr_t)0xdeadbeef); )
+  DEBUG_ONLY( def = (Node*)((intptr_t)0xdeadbeef); )
 
   // After some number of kills there _may_ be a later def
   Node *later_def = nullptr;
@@ -3674,7 +3674,7 @@ void PhaseOutput::print_statistics() {
 #endif
 
 int PhaseOutput::max_inst_size() {
-  if (AOTCodeCache::is_on_for_write()) {
+  if (AOTCodeCache::is_on_for_dump()) {
     // See the comment in output.hpp.
     return 16384;
   } else {

@@ -91,8 +91,7 @@
   product(ccstr, ExtraSharedClassListFile, nullptr,                         \
           "Extra classlist for building the CDS archive file")              \
                                                                             \
-  /*FIXME - AOT code has direct pointers to metadata that's not relocated*/ \
-  product(int, ArchiveRelocationMode, 0, DIAGNOSTIC,                        \
+  product(int, ArchiveRelocationMode, 1, DIAGNOSTIC,                        \
            "(0) first map at preferred address, and if "                    \
            "unsuccessful, map at alternative address; "                     \
            "(1) always map at alternative address (default); "              \
@@ -175,6 +174,28 @@
    product(double, AOTDelayRecompilation, 0.0,                              \
            "Delay recompilation for given number of seconds")               \
                                                                             \
+  /* AOT Code flags */                                                      \
+                                                                            \
+  product(bool, AOTCodeCaching, false, DIAGNOSTIC,                          \
+          "Enable saving and restoring JIT comiled code in AOT cache")      \
+                                                                            \
+  product(bool, AOTStubCaching, false, DIAGNOSTIC,                          \
+          "Enable saving and restoring stubs and code blobs in AOT cache")  \
+                                                                            \
+  product(bool, AOTAdapterCaching, false, DIAGNOSTIC,                       \
+          "Enable saving and restoring i2c2i adapters in AOT cache")        \
+                                                                            \
+  product(uint, AOTCodeMaxSize, 512*M, DIAGNOSTIC,                          \
+          "Buffer size in bytes for AOT code caching")                      \
+          range(1*M, max_jint)                                              \
+                                                                            \
+  product(bool, AbortVMOnAOTCodeFailure, false, DIAGNOSTIC,                 \
+          "Abort VM on the first occurrence of AOT code load or store "     \
+          "failure. By default VM will continue execute without AOT code.") \
+                                                                            \
+  develop(bool, TestAOTAdapterLinkFailure, false,                           \
+          "Test failure of adapter linking when loading from AOT cache.")   \
+                                                                            \
   /*========== New options added by Leyden =============================*/  \
                                                                             \
   product(ccstrlist, AOTEndTrainingOnMethodEntry, "",                       \
@@ -215,10 +236,6 @@
                                                                             \
   product(bool, SkipArchiveHeapVerification, false,                         \
           "Skip verification of CDS archive heap")                          \
-                                                                            \
-  product(bool, ArchiveAdapters, false,                                     \
-          "Archive AdapterFingerPrint and AdapterHandlerEntry."             \
-          "Requires AOT code cache")                                        \
 
 // end of CDS_FLAGS
 

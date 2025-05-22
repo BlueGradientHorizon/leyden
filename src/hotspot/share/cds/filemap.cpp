@@ -837,7 +837,7 @@ bool FileMapRegion::check_region_crc(char* base) const {
 
 static const char* region_name(int region_index) {
   static const char* names[] = {
-    "rw", "ro", "bm", "hp", "cc",
+    "rw", "ro", "bm", "hp", "ac"
   };
   const int num_regions = sizeof(names)/sizeof(names[0]);
   assert(0 <= region_index && region_index < num_regions, "sanity");
@@ -925,7 +925,7 @@ void FileMapInfo::write_region(int region, char* base, size_t size,
                    region_name(region), region, size, p2i(requested_base), _file_offset, crc);
   } else {
     log_info(cds)("Shared file region (%s) %d: %8zu"
-                  " bytes", region_name(region), region, size);
+                   " bytes", region_name(region), region, size);
   }
 
   r->init(region, mapping_offset, size, read_only, allow_exec, crc);
@@ -960,14 +960,14 @@ size_t FileMapInfo::remove_bitmap_zeros(CHeapBitMap* map) {
 }
 
 char* FileMapInfo::write_bitmap_region(CHeapBitMap* rw_ptrmap, CHeapBitMap* ro_ptrmap,
-                                       CHeapBitMap* cc_ptrmap,
+                                       CHeapBitMap* ac_ptrmap,
                                        ArchiveHeapInfo* heap_info,
                                        size_t &size_in_bytes) {
   size_t removed_rw_leading_zeros = remove_bitmap_zeros(rw_ptrmap);
   size_t removed_ro_leading_zeros = remove_bitmap_zeros(ro_ptrmap);
   header()->set_rw_ptrmap_start_pos(removed_rw_leading_zeros);
   header()->set_ro_ptrmap_start_pos(removed_ro_leading_zeros);
-  size_in_bytes = rw_ptrmap->size_in_bytes() + ro_ptrmap->size_in_bytes() + cc_ptrmap->size_in_bytes();
+  size_in_bytes = rw_ptrmap->size_in_bytes() + ro_ptrmap->size_in_bytes() + ac_ptrmap->size_in_bytes();
 
   if (heap_info->is_used()) {
     // Remove leading and trailing zeros
@@ -994,8 +994,8 @@ char* FileMapInfo::write_bitmap_region(CHeapBitMap* rw_ptrmap, CHeapBitMap* ro_p
   region_at(MetaspaceShared::ro)->init_ptrmap(written, ro_ptrmap->size());
   written = write_bitmap(ro_ptrmap, buffer, written);
 
-  region_at(MetaspaceShared::cc)->init_ptrmap(written, cc_ptrmap->size());
-  written = write_bitmap(cc_ptrmap, buffer, written);
+  region_at(MetaspaceShared::ac)->init_ptrmap(written, ac_ptrmap->size());
+  written = write_bitmap(ac_ptrmap, buffer, written);
 
   if (heap_info->is_used()) {
     FileMapRegion* r = region_at(MetaspaceShared::hp);
@@ -1087,10 +1087,10 @@ void FileMapInfo::close() {
  */
 static char* map_memory(int fd, const char* file_name, size_t file_offset,
                         char *addr, size_t bytes, bool read_only,
-                        bool allow_exec, MemTag mem_tag = mtNone) {
+                        bool allow_exec, MemTag mem_tag) {
   char* mem = os::map_memory(fd, file_name, file_offset, addr, bytes,
-                             AlwaysPreTouch ? false : read_only,
-                             allow_exec, mem_tag);
+                             mem_tag, AlwaysPreTouch ? false : read_only,
+                             allow_exec);
   if (mem != nullptr && AlwaysPreTouch) {
     os::pretouch_memory(mem, mem + bytes);
   }
@@ -1115,7 +1115,7 @@ bool FileMapInfo::remap_shared_readonly_as_readwrite() {
   assert(WINDOWS_ONLY(false) NOT_WINDOWS(true), "Don't call on Windows");
   // Replace old mapping with new one that is writable.
   char *base = os::map_memory(_fd, _full_path, r->file_offset(),
-                              addr, size, false /* !read_only */,
+                              addr, size, mtNone, false /* !read_only */,
                               r->allow_exec());
   close();
   // These have to be errors because the shared region is now unmapped.
@@ -1296,8 +1296,8 @@ char* FileMapInfo::map_bitmap_region() {
   return bitmap_base;
 }
 
-bool FileMapInfo::map_cached_code_region(ReservedSpace rs) {
-  FileMapRegion* r = region_at(MetaspaceShared::cc);
+bool FileMapInfo::map_aot_code_region(ReservedSpace rs) {
+  FileMapRegion* r = region_at(MetaspaceShared::ac);
   assert(r->used() > 0 && r->used_aligned() == rs.size(), "must be");
 
   char* requested_base = rs.base();
@@ -1305,28 +1305,30 @@ bool FileMapInfo::map_cached_code_region(ReservedSpace rs) {
 
   char* mapped_base;
   if (MetaspaceShared::use_windows_memory_mapping()) {
-    if (!read_region(MetaspaceShared::cc, requested_base, r->used_aligned(), /* do_commit = */ true)) {
-      log_info(cds)("Failed to read cc shared space into reserved space at " INTPTR_FORMAT,
+    if (!read_region(MetaspaceShared::ac, requested_base, r->used_aligned(), /* do_commit = */ true)) {
+      log_info(cds)("Failed to read aot code shared space into reserved space at " INTPTR_FORMAT,
                     p2i(requested_base));
       return false;
     }
     mapped_base = requested_base;
   } else {
+    // We do not execute in-place in the AOT code region.
+    // AOT code is copied to the CodeCache for execution.
     bool read_only = false, allow_exec = false;
     mapped_base = map_memory(_fd, _full_path, r->file_offset(),
                              requested_base, r->used_aligned(), read_only, allow_exec, mtClassShared);
   }
   if (mapped_base == nullptr) {
-    log_info(cds)("failed to map cached code region");
+    log_info(cds)("failed to map aot code region");
     return false;
   } else {
     assert(mapped_base == requested_base, "must be");
     r->set_mapped_from_file(true);
     r->set_mapped_base(mapped_base);
-    relocate_pointers_in_cached_code_region();
+    relocate_pointers_in_aot_code_region();
     log_info(cds)("Mapped static  region #%d at base " INTPTR_FORMAT " top " INTPTR_FORMAT " (%s)",
-                  MetaspaceShared::cc, p2i(r->mapped_base()), p2i(r->mapped_end()),
-                  shared_region_name[MetaspaceShared::cc]);
+                  MetaspaceShared::ac, p2i(r->mapped_base()), p2i(r->mapped_end()),
+                  shared_region_name[MetaspaceShared::ac]);
     return true;
   }
 }
@@ -1358,26 +1360,26 @@ public:
   }
 };
 
-void FileMapInfo::relocate_pointers_in_cached_code_region() {
-  FileMapRegion* r = region_at(MetaspaceShared::cc);
+void FileMapInfo::relocate_pointers_in_aot_code_region() {
+  FileMapRegion* r = region_at(MetaspaceShared::ac);
   char* bitmap_base = map_bitmap_region();
 
-  BitMapView cc_ptrmap = ptrmap_view(MetaspaceShared::cc);
-  if (cc_ptrmap.size() == 0) {
+  BitMapView ac_ptrmap = ptrmap_view(MetaspaceShared::ac);
+  if (ac_ptrmap.size() == 0) {
     return;
   }
 
   address core_regions_requested_base = (address)header()->requested_base_address();
   address core_regions_mapped_base = (address)header()->mapped_base_address();
-  address cc_region_requested_base = core_regions_requested_base + r->mapping_offset();
-  address cc_region_mapped_base = (address)r->mapped_base();
+  address ac_region_requested_base = core_regions_requested_base + r->mapping_offset();
+  address ac_region_mapped_base = (address)r->mapped_base();
 
   size_t max_bits_for_core_regions = pointer_delta(mapped_end(), mapped_base(), // FIXME - renamed to core_regions_mapped_base(), etc
                                                    sizeof(address));
 
-  CachedCodeRelocator patcher(cc_region_requested_base, cc_region_mapped_base,
+  CachedCodeRelocator patcher(ac_region_requested_base, ac_region_mapped_base,
                               core_regions_mapped_base - core_regions_requested_base);
-  cc_ptrmap.iterate(&patcher);
+  ac_ptrmap.iterate(&patcher);
 }
 
 class SharedDataRelocationTask : public ArchiveWorkerTask {
@@ -1726,7 +1728,7 @@ bool FileMapInfo::map_heap_region_impl() {
   } else {
     base = map_memory(_fd, _full_path, r->file_offset(),
                       addr, _mapped_heap_memregion.byte_size(), r->read_only(),
-                      r->allow_exec());
+                      r->allow_exec(), mtJavaHeap);
     if (base == nullptr || base != addr) {
       dealloc_heap_region();
       log_info(cds)("UseSharedSpaces: Unable to map at required address in java heap. "

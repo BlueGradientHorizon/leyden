@@ -22,6 +22,7 @@
  *
  */
 
+#include "cds/aotCacheAccess.hpp"
 #include "cds/aotClassInitializer.hpp"
 #include "cds/aotArtifactFinder.hpp"
 #include "cds/aotClassInitializer.hpp"
@@ -29,11 +30,11 @@
 #include "cds/aotClassLocation.hpp"
 #include "cds/aotConstantPoolResolver.hpp"
 #include "cds/aotLinkedClassBulkLoader.hpp"
+#include "cds/aotReferenceObjSupport.hpp"
 #include "cds/archiveBuilder.hpp"
 #include "cds/archiveHeapLoader.hpp"
 #include "cds/archiveHeapWriter.hpp"
 #include "cds/cds_globals.hpp"
-#include "cds/cdsAccess.hpp"
 #include "cds/cdsConfig.hpp"
 #include "cds/cdsProtectionDomain.hpp"
 #include "cds/classListParser.hpp"
@@ -99,6 +100,7 @@
 #include "runtime/vmOperations.hpp"
 #include "runtime/vmThread.hpp"
 #include "sanitizers/leak.hpp"
+#include "services/management.hpp"
 #include "utilities/align.hpp"
 #include "utilities/bitMap.inline.hpp"
 #include "utilities/defaultStream.hpp"
@@ -118,6 +120,7 @@ char* MetaspaceShared::_requested_base_address;
 Array<Method*>* MetaspaceShared::_archived_method_handle_intrinsics = nullptr;
 bool MetaspaceShared::_use_optimized_module_handling = true;
 int volatile MetaspaceShared::_preimage_static_archive_dumped = 0;
+jlong MetaspaceShared::_preimage_static_archive_recording_duration = 0;
 
 // The CDS archive is divided into the following regions:
 //     rw  - read-write metadata
@@ -642,8 +645,8 @@ char* VM_PopulateDumpSharedSpace::dump_read_only_tables(AOTClassLocationConfig*&
   // Write lambform lines into archive
   LambdaFormInvokers::dump_static_archive_invokers();
 
-  if (CDSConfig::is_dumping_adapters()) {
-    AdapterHandlerLibrary::archive_adapter_table();
+  if (AOTCodeCache::is_dumping_adapter()) {
+    AdapterHandlerLibrary::dump_aot_adapter_table();
   }
 
   // Write the other data to the output array.
@@ -969,11 +972,23 @@ bool MetaspaceShared::is_recording_preimage_static_archive() {
   return false;
 }
 
+jlong MetaspaceShared::get_preimage_static_archive_recording_duration() {
+  if (CDSConfig::is_dumping_preimage_static_archive()) {
+    if (_preimage_static_archive_recording_duration == 0) {
+      // The recording has not yet finished so return the current elapsed time.
+      return Management::ticks_to_ms(os::elapsed_counter());
+    }
+    return _preimage_static_archive_recording_duration;
+  }
+  return 0;
+}
+
 void MetaspaceShared::preload_and_dump_impl(StaticArchiveBuilder& builder, TRAPS) {
   if (CDSConfig::is_dumping_preimage_static_archive()) {
     if (Atomic::cmpxchg(&_preimage_static_archive_dumped, 0, 1) != 0) {
       return;
     }
+    _preimage_static_archive_recording_duration = Management::ticks_to_ms(os::elapsed_counter());
   }
 
   if (CDSConfig::is_dumping_classic_static_archive()) {
@@ -1037,6 +1052,7 @@ void MetaspaceShared::preload_and_dump_impl(StaticArchiveBuilder& builder, TRAPS
 #if INCLUDE_CDS_JAVA_HEAP
   if (CDSConfig::is_dumping_heap()) {
     ArchiveHeapWriter::init();
+
     if (CDSConfig::is_dumping_full_module_graph()) {
       ClassLoaderDataShared::ensure_module_entry_tables_exist();
       HeapShared::reset_archived_object_states(CHECK);
@@ -1045,6 +1061,9 @@ void MetaspaceShared::preload_and_dump_impl(StaticArchiveBuilder& builder, TRAPS
     if (ArchiveLoaderLookupCache) {
       SystemDictionaryShared::create_loader_positive_lookup_cache(CHECK);
     }
+
+    AOTReferenceObjSupport::initialize(CHECK);
+    AOTReferenceObjSupport::stabilize_cached_reference_objects(CHECK);
 
     if (CDSConfig::is_initing_classes_at_dump_time()) {
       // java.lang.Class::reflectionFactory cannot be archived yet. We set this field
@@ -1075,9 +1094,9 @@ void MetaspaceShared::preload_and_dump_impl(StaticArchiveBuilder& builder, TRAPS
   ArchiveHeapInfo* heap_info = op.heap_info();
 
   if (CDSConfig::is_dumping_final_static_archive()) {
-    if (StoreCachedCode) {
+    if (AOTCodeCache::is_caching_enabled()) {
       if (log_is_enabled(Info, cds, jit)) {
-        CDSAccess::test_heap_access_api();
+        AOTCacheAccess::test_heap_access_api();
       }
 
       // We have just created the final image. Let's run the AOT compiler
@@ -1086,15 +1105,15 @@ void MetaspaceShared::preload_and_dump_impl(StaticArchiveBuilder& builder, TRAPS
         TrainingData::print_archived_training_data_on(tty);
       }
 
-      CDSConfig::enable_dumping_cached_code();
+      CDSConfig::enable_dumping_aot_code();
       {
-        builder.start_cc_region();
+        builder.start_ac_region();
         Precompiler::compile_cached_code(&builder, CHECK);
-        // Write the contents to cached code region and close AOTCodeCache before packing the region
+        // Write the contents to aot code region and close AOTCodeCache before packing the region
         AOTCodeCache::close();
-        builder.end_cc_region();
+        builder.end_ac_region();
       }
-      CDSConfig::disable_dumping_cached_code();
+      CDSConfig::disable_dumping_aot_code();
     }
   }
 
@@ -1518,8 +1537,8 @@ void MetaspaceShared::open_static_archive() {
   if (!mapinfo->open_as_input()) {
     delete(mapinfo);
   } else {
-    FileMapRegion* r = mapinfo->region_at(MetaspaceShared::cc);
-    CDSAccess::set_cached_code_size(r->used_aligned());
+    FileMapRegion* r = mapinfo->region_at(MetaspaceShared::ac);
+    AOTCacheAccess::set_aot_code_region_size(r->used_aligned());
   }
 }
 
@@ -1652,7 +1671,7 @@ MapArchiveResult MetaspaceShared::map_archives(FileMapInfo* static_mapinfo, File
         if (prot_zone_size > 0) {
           assert(prot_zone_size >= os::vm_allocation_granularity(), "must be"); // not just page size!
           char* p = os::attempt_reserve_memory_at(mapped_base_address, prot_zone_size,
-                                                  false, MemTag::mtClassShared);
+                                                  mtClassShared);
           assert(p == mapped_base_address || p == nullptr, "must be");
           if (p == nullptr) {
             log_debug(cds)("Failed to re-reserve protection zone");
@@ -1844,7 +1863,8 @@ char* MetaspaceShared::reserve_address_space_for_archives(FileMapInfo* static_ma
     archive_space_rs = MemoryReserver::reserve((char*)base_address,
                                                archive_space_size,
                                                archive_space_alignment,
-                                               os::vm_page_size());
+                                               os::vm_page_size(),
+                                               mtNone);
     if (archive_space_rs.is_reserved()) {
       assert(base_address == nullptr ||
              (address)archive_space_rs.base() == base_address, "Sanity");
@@ -1912,11 +1932,13 @@ char* MetaspaceShared::reserve_address_space_for_archives(FileMapInfo* static_ma
       archive_space_rs = MemoryReserver::reserve((char*)base_address,
                                                  archive_space_size,
                                                  archive_space_alignment,
-                                                 os::vm_page_size());
+                                                 os::vm_page_size(),
+                                                 mtNone);
       class_space_rs   = MemoryReserver::reserve((char*)ccs_base,
                                                  class_space_size,
                                                  class_space_alignment,
-                                                 os::vm_page_size());
+                                                 os::vm_page_size(),
+                                                 mtNone);
     }
     if (!archive_space_rs.is_reserved() || !class_space_rs.is_reserved()) {
       release_reserved_spaces(total_space_rs, archive_space_rs, class_space_rs);
@@ -1929,7 +1951,8 @@ char* MetaspaceShared::reserve_address_space_for_archives(FileMapInfo* static_ma
       total_space_rs = MemoryReserver::reserve((char*) base_address,
                                                total_range_size,
                                                base_address_alignment,
-                                               os::vm_page_size());
+                                               os::vm_page_size(),
+                                               mtNone);
     } else {
       // We did not manage to reserve at the preferred address, or were instructed to relocate. In that
       // case we reserve wherever possible, but the start address needs to be encodable as narrow Klass
@@ -2136,8 +2159,8 @@ void MetaspaceShared::initialize_shared_spaces() {
     }
     TrainingData::print_archived_training_data_on(tty);
 
-    if (LoadCachedCode) {
-      tty->print_cr("\n\nCached Code");
+    if (AOTCodeCache::is_on_for_use()) {
+      tty->print_cr("\n\nAOT Code");
       AOTCodeCache::print_on(tty);
     }
 

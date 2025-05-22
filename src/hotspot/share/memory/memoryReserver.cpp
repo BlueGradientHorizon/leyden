@@ -90,13 +90,13 @@ static char* reserve_memory_inner(char* requested_address,
     assert(is_aligned(requested_address, alignment),
            "Requested address " PTR_FORMAT " must be aligned to %zu",
            p2i(requested_address), alignment);
-    return os::attempt_reserve_memory_at(requested_address, size, exec, mem_tag);
+    return os::attempt_reserve_memory_at(requested_address, size, mem_tag, exec);
   }
 
   // Optimistically assume that the OS returns an aligned base pointer.
   // When reserving a large address range, most OSes seem to align to at
   // least 64K.
-  char* base = os::reserve_memory(size, exec, mem_tag);
+  char* base = os::reserve_memory(size, mem_tag, exec);
   if (is_aligned(base, alignment)) {
     return base;
   }
@@ -107,7 +107,7 @@ static char* reserve_memory_inner(char* requested_address,
   }
 
   // Map using the requested alignment.
-  return os::reserve_memory_aligned(size, alignment, exec);
+  return os::reserve_memory_aligned(size, alignment, mem_tag, exec);
 }
 
 ReservedSpace MemoryReserver::reserve_memory(char* requested_address,
@@ -261,7 +261,7 @@ static char* map_memory_to_file(char* requested_address,
   // Optimistically assume that the OS returns an aligned base pointer.
   // When reserving a large address range, most OSes seem to align to at
   // least 64K.
-  char* base = os::map_memory_to_file(size, fd);
+  char* base = os::map_memory_to_file(size, fd, mem_tag);
   if (is_aligned(base, alignment)) {
     return base;
   }
@@ -503,7 +503,8 @@ static ReservedSpace establish_noaccess_prefix(const ReservedSpace& reserved, si
   assert(reserved.alignment() >= os::vm_page_size(), "must be at least page size big");
   assert(reserved.is_reserved(), "should only be called on a reserved memory area");
 
-  if (reserved.end() > (char *)OopEncodingHeapMax) {
+  if (reserved.end() > (char *)OopEncodingHeapMax || UseCompatibleCompressedOops) {
+    assert((reserved.base() != nullptr), "sanity");
     if (true
         WIN64_ONLY(&& !UseLargePages)
         AIX_ONLY(&& (os::Aix::supports_64K_mmap_pages() || os::vm_page_size() == 4*K))) {
@@ -549,13 +550,20 @@ ReservedHeapSpace HeapReserver::Instance::reserve_compressed_oops_heap(const siz
   const size_t attach_point_alignment = lcm(alignment, os_attach_point_alignment);
 
   char* aligned_heap_base_min_address = align_up((char*)HeapBaseMinAddress, alignment);
-  size_t noaccess_prefix = ((aligned_heap_base_min_address + size) > (char*)OopEncodingHeapMax) ?
-    noaccess_prefix_size : 0;
+  char* heap_end_address = aligned_heap_base_min_address + size;
+
+  bool unscaled  = false;
+  bool zerobased = false;
+  if (!UseCompatibleCompressedOops) { // heap base is not enforced
+    unscaled  = (heap_end_address <= (char*)UnscaledOopHeapMax);
+    zerobased = (heap_end_address <= (char*)OopEncodingHeapMax);
+  }
+  size_t noaccess_prefix = !zerobased ? noaccess_prefix_size : 0;
 
   ReservedSpace reserved{};
 
   // Attempt to alloc at user-given address.
-  if (!FLAG_IS_DEFAULT(HeapBaseMinAddress)) {
+  if (!FLAG_IS_DEFAULT(HeapBaseMinAddress) || UseCompatibleCompressedOops) {
     reserved = try_reserve_memory(size + noaccess_prefix, alignment, page_size, aligned_heap_base_min_address);
     if (reserved.base() != aligned_heap_base_min_address) { // Enforce this exact address.
       release(reserved);
@@ -577,7 +585,7 @@ ReservedHeapSpace HeapReserver::Instance::reserve_compressed_oops_heap(const siz
 
     // Attempt to allocate so that we can run without base and scale (32-Bit unscaled compressed oops).
     // Give it several tries from top of range to bottom.
-    if (aligned_heap_base_min_address + size <= (char *)UnscaledOopHeapMax) {
+    if (unscaled) {
 
       // Calc address range within we try to attach (range of possible start addresses).
       char* const highest_start = align_down((char *)UnscaledOopHeapMax - size, attach_point_alignment);
@@ -590,9 +598,9 @@ ReservedHeapSpace HeapReserver::Instance::reserve_compressed_oops_heap(const siz
     char *zerobased_max = (char *)OopEncodingHeapMax;
 
     // Give it several tries from top of range to bottom.
-    if (aligned_heap_base_min_address + size <= zerobased_max && // Zerobased theoretical possible.
-        ((!reserved.is_reserved()) ||                            // No previous try succeeded.
-         (reserved.end() > zerobased_max))) {                    // Unscaled delivered an arbitrary address.
+    if (zerobased &&                          // Zerobased theoretical possible.
+        ((!reserved.is_reserved()) ||         // No previous try succeeded.
+         (reserved.end() > zerobased_max))) { // Unscaled delivered an arbitrary address.
 
       // Release previous reservation
       release(reserved);
@@ -658,6 +666,7 @@ ReservedHeapSpace HeapReserver::Instance::reserve_compressed_oops_heap(const siz
     }
 
     // We reserved heap memory without a noaccess prefix.
+    assert(!UseCompatibleCompressedOops, "noaccess prefix is missing");
     return ReservedHeapSpace(reserved, 0 /* noaccess_prefix */);
   }
 

@@ -78,6 +78,9 @@ compiler/ciReplay/TestIncrementalInlining.java 8349191 generic-all
 
 compiler/c2/TestVerifyConstraintCasts.java 8355574 generic-all
 
+compiler/c2/irTests/TestFloat16ScalarOperations.java 8355708 linux-aarch64
+compiler/c2/irTests/MulHFNodeIdealizationTests.java 8355708 linux-aarch64
+
 #############################################################################
 
 # :hotspot_gc
@@ -230,8 +233,3 @@ runtime/cds/appcds/leyden/CacheOnlyClassesIn.java#aot 8350619 generic-all
 runtime/cds/appcds/leyden/CacheOnlyClassesIn.java#dynamic 8350619 generic-all
 runtime/cds/appcds/leyden/CacheOnlyClassesIn.java#leyden 8350619 generic-all
 runtime/cds/appcds/leyden/CacheOnlyClassesIn.java#static 8350619 generic-all
-
-runtime/cds/appcds/ArchiveRelocationTest.java 8340474 generic-all
-runtime/cds/appcds/dynamicArchive/DynamicArchiveRelocationTest.java 8340474 generic-all
-
-

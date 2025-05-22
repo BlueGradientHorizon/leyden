@@ -935,6 +935,8 @@ public:
 
   void set_narrow_oop(Register dst, jobject obj);
 
+  void decode_klass_not_null_for_aot(Register dst, Register src);
+  void encode_klass_not_null_for_aot(Register dst, Register src);
   void encode_klass_not_null(Register r);
   void decode_klass_not_null(Register r);
   void encode_klass_not_null(Register dst, Register src);
@@ -1316,7 +1318,7 @@ public:
 
   // Check if branches to the non nmethod section require a far jump
   static bool codestub_branch_needs_far_jump() {
-    if (AOTCodeCache::is_on_for_write()) {
+    if (AOTCodeCache::is_on_for_dump()) {
       // To calculate far_codestub_branch_size correctly.
       return true;
     }
@@ -1479,16 +1481,6 @@ public:
   //
 
   public:
-
-  void ldr_constant(Register dest, const Address &const_addr) {
-    if (NearCpool) {
-      ldr(dest, const_addr);
-    } else {
-      uint64_t offset;
-      adrp(dest, InternalAddress(const_addr.target()), offset);
-      ldr(dest, Address(dest, offset));
-    }
-  }
 
   address read_polling_page(Register r, relocInfo::relocType rtype);
   void get_polling_page(Register dest, relocInfo::relocType rtype);
